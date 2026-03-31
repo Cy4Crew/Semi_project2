@@ -38,8 +38,13 @@ docker compose up --build
 - `/api/reports/{id}/view` : Detail page
 - `/api/reports/{id}/download` : Download
 
+
 ---
 
 ## Flow
 
 Upload → Extract → Analyze → Score → Report
+
+---
+
+For more details, see [README_OPERATIONS.md](./README_OPERATIONS.md)
