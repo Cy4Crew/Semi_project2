@@ -1,35 +1,35 @@
 # Malware Sandbox Platform - Operations Guide
 
-이 문서는 시스템 동작 방식과 내부 구조를 설명한다.
+This document explains system behavior and internal structure.
 
 ---
 
 ## 1. System Overview
 
-이 시스템은 업로드된 ZIP 파일을 분석하여 악성 여부를 판단한다.
+The system analyzes uploaded ZIP files to determine whether they are malicious.
 
-전체 흐름:
+Workflow:
 
-1. ZIP 업로드
-2. 안전 검증 및 압축 해제
-3. 정적 분석 수행
-4. 제한된 환경에서 동적 실행
-5. 로그 및 행위 수집
-6. 점수 계산
-7. 리포트 생성
+1. Upload ZIP
+2. Validate and safely extract
+3. Perform static analysis
+4. Execute in restricted environment
+5. Collect logs and behavior
+6. Calculate score
+7. Generate report
 
 ---
 
 ## 2. System Architecture
 
-구성 요소:
+Components:
 
-- API Server: 업로드 및 결과 조회 처리
-- Worker: 분석 작업 수행
-- Analyzer: 정적/동적 분석 로직
-- Database: 작업 상태 및 결과 저장
+- API Server: Handles upload and query requests
+- Worker: Executes analysis jobs
+- Analyzer: Performs static and dynamic analysis
+- Database: Stores job states and results
 
-데이터 흐름:
+Data Flow:
 
 Upload → API → Queue(DB) → Worker → Analyzer → DB → API Response
 
@@ -37,60 +37,60 @@ Upload → API → Queue(DB) → Worker → Analyzer → DB → API Response
 
 ## 3. Database Overview
 
-주요 테이블:
+Main tables:
 
-- samples: 업로드된 파일 정보
-- reports: 분석 결과
-- trace_queue: 작업 큐 (worker가 소비)
+- samples: Uploaded file metadata
+- reports: Analysis results
+- trace_queue: Job queue consumed by workers
 
-주의:
-- trace_queue가 없으면 worker 실행 시 오류 발생
+Note:
+- Missing `trace_queue` causes worker failure
 
 ---
 
 ## 4. Security Controls
 
-### Upload 제한
-- ZIP 파일만 허용
-- Content-Type 검사
-- 최대 업로드 크기 제한
-- 최대 파일 개수 제한
-- 압축 해제 후 총 크기 제한
+### Upload Restrictions
+- Only ZIP files allowed
+- Content-Type validation
+- Max upload size limit
+- Max file count limit
+- Total extracted size limit
 
-### ZIP 보안
-- Zip Slip 공격 차단
-- 경로 검증 수행
+### ZIP Security
+- Zip Slip protection
+- Path validation enforced
 
 ---
 
 ## 5. Analysis Pipeline
 
 ### Static Analysis
-- 파일 구조 분석
-- 문자열 추출
-- 의심 패턴 탐지
+- File structure inspection
+- String extraction
+- Suspicious pattern detection
 
 ### Dynamic Analysis
-- 제한된 환경에서 실행
-- stdout / stderr 수집
-- 프로세스 상태 기록
-- 타임아웃 처리
+- Execution in restricted environment
+- stdout / stderr collection
+- Process monitoring
+- Timeout handling
 
 ---
 
 ## 6. Scoring System
 
-점수는 다음 요소 기반:
+Score is calculated based on:
 
-- 의심 문자열
-- 실행 결과
-- 행위 로그
-- 파일 구조
+- Suspicious strings
+- Execution results
+- Behavior logs
+- File structure
 
-출력:
-- 총 점수
-- 세부 breakdown
-- 주요 evidence
+Output:
+- Total score
+- Detailed breakdown
+- Key evidence
 
 ---
 
@@ -115,66 +115,62 @@ GET /api/reports/{id}/download
 
 - stdout
 - stderr
-- 실행 프로세스 정보
-- 분석 단계 로그
-- timeout 여부
+- Process information
+- Analysis logs
+- Timeout status
 
 ---
 
 ## 10. Common Errors & Fixes
 
 ### 1. relation "trace_queue" does not exist
-원인:
-- DB 초기화 안됨
 
-해결:
-```
+Cause:
+- Database not initialized
+
+Fix:
 python -m app.init_db
-```
 
 ---
 
 ### 2. Internal Server Error (JSON parse error)
 
-원인:
-- API가 JSON 대신 문자열/에러 반환
+Cause:
+- API returns non-JSON response
 
-해결:
-- API 응답 Content-Type 확인
-- frontend에서 JSON.parse 전 응답 검증
+Fix:
+- Check Content-Type
+- Validate response before JSON parsing
 
 ---
 
 ## 11. Execution Environment
 
-권장 환경: Docker
+Recommended: Docker
 
-실행:
+Run:
 
-```
 docker compose up --build
-```
 
-설명:
-- API, DB, Worker 분리 실행
-- 격리된 환경에서 분석 수행
+Details:
+- API, DB, Worker separated
+- Isolated execution environment
 
-주의:
-- 로컬 실행 시 악성코드 실행 위험 존재
-- 반드시 테스트 환경에서 실행
+Warning:
+- Running locally may execute malware
+- Use isolated test environment
 
 ---
 
 ## 12. Execution Notes
 
-- 실행은 완전한 sandbox가 아님 (경량 환경)
-- 실제 악성코드 실행 시 주의 필요
-- 테스트용 샘플 권장
+- Not a full sandbox (lightweight environment)
+- Use only test samples
 
 ---
 
 ## 13. Best Practice
 
-- 반드시 격리된 환경에서 실행
-- Docker 사용 권장
-- 외부 네트워크 차단 환경 권장
+- Always run in isolated environment
+- Use Docker
+- Block external network if possible
