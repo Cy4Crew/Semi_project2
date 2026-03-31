@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./samples:/app/samples
+      - ./artifacts:/app/artifacts
+      - ./rules:/app/rules
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      SAMPLE_TIMEOUT_SECONDS: 5
+    restart: unless-stopped
