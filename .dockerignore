@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+artifacts/
+samples/
+.git/
+.idea/
+.vscode/
