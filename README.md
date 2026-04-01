@@ -1,52 +1,70 @@
 # Malware Sandbox Platform
 
-A ZIP-based malware analysis demo system.  
-Automates the process: Upload → Analyze → Score → Generate Report.
+A lightweight malware analysis sandbox that processes uploaded ZIP archives and produces evidence-based risk scores and verdicts.
 
 ---
 
-## Features
+## Overview
 
-- ZIP file upload and validation
-- Secure extraction (Zip Slip protection)
-- Static analysis + basic dynamic execution
-- Score-based malware classification
-- Sample hashing (MD5 / SHA-1 / SHA-256)
-- Reanalysis and evidence export
-- Evidence-based result output
-- JSON report download support
+This system performs static and restricted dynamic analysis on uploaded samples.  
+It extracts indicators, detects suspicious behavior patterns, and assigns a risk score with a final verdict.
 
 ---
 
-## Run
+## Key Features
 
+- Secure ZIP upload and extraction (Zip Slip protection)
+- Static analysis:
+  - YARA rule matching
+  - IOC extraction (IP, domain, URL, email)
+  - Suspicious keyword detection
+  - Obfuscation indicators
+- Dynamic analysis (restricted environment):
+  - Execution of supported file types
+  - stdout / stderr capture
+  - basic behavior tracing
+- Risk scoring system with clear verdicts
+- Web UI for browsing reports and evidence
+
+---
+
+## Quick Start
+
+```bash
 pip install -r requirements.txt
 python run.py
+```
 
 ---
 
 ## Docker
 
+```bash
 docker compose up --build
+```
 
 ---
 
-## API
+## API Endpoints
 
-- `/` : Dashboard
-- `/api/samples/upload` : Upload sample
-- `/api/reports/` : Report list
-- `/api/reports/{id}` : JSON result
-- `/api/reports/{id}/view` : Detail page
-- `/api/reports/{id}/download` : Download
+- `/` : Dashboard  
+- `/api/samples/upload` : Upload sample  
+- `/api/reports/` : List reports  
+- `/api/reports/{id}` : JSON report  
+- `/api/reports/{id}/view` : UI detail  
+- `/api/reports/{id}/download` : Download result  
 
+---
+
+## Verdict Levels
+
+- clean
+- review
+- suspicious
+- malicious
 
 ---
 
-## Flow
-
-Upload → Extract → Analyze → Score → Report → Export Evidence
-
----
+## Documentation
 
 For more details, see [README_OPERATIONS.md](./README_OPERATIONS.md)
