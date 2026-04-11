@@ -28,3 +28,5 @@ class ReportOut(BaseModel):
     static_result: dict
     dynamic_result: dict
     iocs: dict
+    malware_type_tags: list[str] | None = None
+    primary_malware_type: str | None = None

@@ -7,6 +7,7 @@ import resource
 import shlex
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from app.sandbox.network_monitor import (
     stop_network_capture,
     stop_tcpdump,
 )
+from app.sandbox.vmware_bridge_backend import run_vmware_bridge_analysis
 
 EXECUTABLE_SUFFIXES = {".py", ".sh", ".js", ".ps1", ".bat", ".cmd", ".exe", ".dll", ".com", ".scr", ".vbs"}
 NATIVE_EXEC_SUFFIXES = {".py", ".sh", ".js", ".ps1", ".bat", ".cmd", ".vbs"}
@@ -116,7 +118,7 @@ def _sandbox_preexec() -> None:
 
 
 def _sandbox_env(work_dir: Path) -> dict[str, str]:
-    env = {
+    result = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(work_dir),
         "TMPDIR": str(work_dir),
@@ -124,7 +126,6 @@ def _sandbox_env(work_dir: Path) -> dict[str, str]:
         "TMP": str(work_dir),
         "PYTHONUNBUFFERED": "1",
     }
-    return env
 
 
 def _stage_target_for_execution(sample_path: str, work_dir: Path) -> Path:
@@ -147,6 +148,12 @@ def _maybe_wrap_with_network_namespace(command: list[str]) -> list[str]:
     return command
 
 
+def _runtime_root() -> Path:
+    root = Path(settings.sandbox_runtime_root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def _unsupported_member_reason(sample_path: str) -> str | None:
     suffix = Path(sample_path).suffix.lower()
     if suffix in {".exe", ".dll", ".com", ".scr"}:
@@ -156,7 +163,6 @@ def _unsupported_member_reason(sample_path: str) -> str | None:
 
 def _execute_one(sample_path: str, timeout_seconds: int, analysis_log_path: Path, role: str, work_dir: Path) -> dict:
     command, strategy = _build_command(sample_path)
-    suffix = Path(sample_path).suffix.lower()
     runtime_path = sample_path
     skipped = False
     skip_reason = None
@@ -237,224 +243,172 @@ def _execute_one(sample_path: str, timeout_seconds: int, analysis_log_path: Path
             "stderr": f"runner_missing:{exc}",
             "strategy": "strings_only",
             "skipped": True,
-            "skip_reason": f"runner missing: {exc}",
-        }
-        try:
-            proc = subprocess.run(
-                fallback_command,
-                capture_output=True,
-                text=True,
-                timeout=max(5, min(timeout_seconds, 15)),
-                cwd=str(work_dir),
-                env=_sandbox_env(work_dir),
-                preexec_fn=_sandbox_preexec,
-            )
-            result["stdout"] = proc.stdout or ""
-            result["stderr"] = ((result["stderr"] + "\n\n") if result["stderr"] else "") + (proc.stderr or "")
-        except Exception as fallback_exc:
-            result["stderr"] = ((result["stderr"] + "\n\n") if result["stderr"] else "") + f"strings_fallback_error:{fallback_exc}"
-    except Exception as exc:
-        result = {
-            "command": command,
-            "returncode": -1,
-            "timed_out": False,
-            "stdout": "",
-            "stderr": str(exc),
-            "strategy": strategy,
-            "skipped": True,
             "skip_reason": str(exc),
         }
-
     _append_stage(
         analysis_log_path,
-        "execute_done",
+        "execute_end",
         role=role,
-        strategy=result["strategy"],
         returncode=result["returncode"],
         timed_out=result["timed_out"],
-        skipped=result["skipped"],
+        strategy=result["strategy"],
+        skipped=result.get("skipped", False),
     )
     return result
 
 
-def _score_runtime_output(stdout: str, stderr: str, fs_delta: dict, network_result: dict) -> dict:
-    combined = f"{stdout}\n{stderr}".lower()
-    exec_keywords = ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript", "bash", "sh "]
-    persistence_keywords = ["currentversion\\run", "schtasks", "startup", "reg add", "autorun"]
-    score = 0
-
-    exec_signal = any(k in combined for k in exec_keywords)
-    persistence_signal = any(k in combined for k in persistence_keywords)
-    file_signal = bool(fs_delta.get("created") or fs_delta.get("changed") or fs_delta.get("deleted"))
-    network_signal = bool(network_result.get("network_signal"))
-
-    if exec_signal:
-        score += 4
-    if persistence_signal:
-        score += 4
-    if file_signal:
-        score += 2
-    if network_signal:
-        score += 4
-
-    preview = (stdout[:2000] + "\n\n" + stderr[:2000]).strip()
-    return {
-        "exec_signal": exec_signal,
-        "persistence_signal": persistence_signal,
-        "file_signal": file_signal,
-        "network_signal": network_signal,
-        "score": score,
-        "combined_output_preview": preview[:4000],
-    }
+def _safe_extract(zip_path: Path, extract_dir: Path) -> None:
+    extract_root = extract_dir.resolve()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            if member.flag_bits & 0x1:
+                continue
+            if any(part in SKIP_PARTS for part in Path(member.filename).parts):
+                continue
+            if int(member.file_size) > int(settings.max_zip_entry_uncompressed_bytes):
+                continue
+            try:
+                target = (extract_dir / member.filename).resolve()
+                if os.path.commonpath([str(target), str(extract_root)]) != str(extract_root):
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+            except Exception:
+                continue
 
 
-def _should_skip_member(name: str) -> bool:
-    parts = set(Path(name).parts)
-    return bool(parts & SKIP_PARTS)
-
-
-def _safe_extract_zip(zf: zipfile.ZipFile, extract_root: Path) -> None:
-    extract_root = extract_root.resolve()
-    for member in zf.infolist():
-        member_path = (extract_root / member.filename).resolve()
-        if not str(member_path).startswith(str(extract_root)):
-            raise ValueError(f"unsafe archive member path: {member.filename}")
-        if member.is_dir():
-            member_path.mkdir(parents=True, exist_ok=True)
+def _list_exec_candidates(root: Path) -> list[Path]:
+    members = []
+    for path in root.rglob("*"):
+        if not path.is_file():
             continue
-        member_path.parent.mkdir(parents=True, exist_ok=True)
-        with zf.open(member) as src, open(member_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-
-
-def _collect_archive_targets(sample_path: str, extract_root: Path) -> tuple[list[Path], int]:
-    targets: list[Path] = []
-    file_count = 0
-    with zipfile.ZipFile(sample_path, "r") as zf:
-        _safe_extract_zip(zf, extract_root)
-
-    for path in extract_root.rglob("*"):
-        if path.is_dir():
+        if any(part in SKIP_PARTS for part in path.parts):
             continue
-        if _should_skip_member(str(path.relative_to(extract_root))):
-            continue
-        file_count += 1
         if path.suffix.lower() in EXECUTABLE_SUFFIXES:
-            targets.append(path)
-    return targets[: int(settings.max_archive_exec_members)], file_count
+            members.append(path)
+    priority = {".exe": 0, ".ps1": 1, ".bat": 2, ".cmd": 3, ".vbs": 4, ".js": 5, ".py": 6, ".sh": 7}
+    members.sort(key=lambda p: (priority.get(p.suffix.lower(), 20), str(p).lower()))
+    return members[: int(settings.max_archive_exec_members)]
 
 
-def run_dynamic_analysis(sample_path: str, job_id: str, artifact_root: str) -> dict:
-    artifact_root = Path(artifact_root)
-    artifact_root.mkdir(parents=True, exist_ok=True)
+def _write_preview(path: Path, text: str) -> None:
+    path.write_text(text[:4000], encoding="utf-8", errors="ignore")
 
-    stdout_path = artifact_root / f"job_{job_id}_stdout.txt"
-    stderr_path = artifact_root / f"job_{job_id}_stderr.txt"
-    proc_path = artifact_root / f"job_{job_id}_processes.json"
-    analysis_log_path = artifact_root / f"job_{job_id}_analysis.log"
-    network_trace_path = artifact_root / f"job_{job_id}_network_trace.json"
-    pcap_path = reserve_pcap_path(str(artifact_root), job_id) if settings.enable_pcap else None
 
-    before_fs = snapshot_tree(artifact_root)
-    before_proc = _process_snapshot()
+def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -> dict:
+    backend = str(settings.sandbox_backend).lower()
+    if backend in {"vmware-bridge", "auto"}:
+        try:
+            return run_vmware_bridge_analysis(sample_path, report_id, artifact_root)
+        except Exception as exc:
+            if backend == "vmware-bridge":
+                raise
+            artifact_root_path = Path(artifact_root)
+            artifact_root_path.mkdir(parents=True, exist_ok=True)
+            fallback_note = artifact_root_path / "vmware_bridge_fallback.txt"
+            fallback_note.write_text(f"vmware_bridge_failed:{exc}\nlocal_sandbox_fallback_enabled", encoding="utf-8")
 
-    extract_root = artifact_root / "archive_exec" / f"job_{job_id}"
-    extract_root.mkdir(parents=True, exist_ok=True)
-    member_results = []
-    total_stdout_parts: list[str] = []
-    total_stderr_parts: list[str] = []
-    returncode = 0
-    timed_out = False
-    archive_file_count = 0
-    skipped_count = 0
+    artifact_root_path = Path(artifact_root)
+    artifact_root_path.mkdir(parents=True, exist_ok=True)
+    analysis_log_path = artifact_root_path / "analysis_log.jsonl"
+    stdout_path = artifact_root_path / "stdout.txt"
+    stderr_path = artifact_root_path / "stderr.txt"
+    extract_dir = artifact_root_path / "extract"
+    work_dir = Path(tempfile.mkdtemp(prefix=f"sandbox_{report_id}_", dir=str(_runtime_root())))
 
-    targets, archive_file_count = _collect_archive_targets(sample_path, extract_root)
-
+    pre_tree = snapshot_tree(artifact_root_path)
+    proc_before = _process_snapshot()
+    capture = start_network_capture(int(settings.sandbox_network_sample_interval_ms))
     tcpdump_proc = None
-    net_capture = start_network_capture(str(network_trace_path))
-    if settings.enable_pcap and pcap_path:
+    pcap_path = None
+    if bool(settings.enable_pcap):
+        pcap_path = reserve_pcap_path(artifact_root)
         tcpdump_proc = start_tcpdump(pcap_path)
 
+    _append_stage(analysis_log_path, "dynamic_begin", report_id=report_id, sample_path=sample_path)
+
+    sample = Path(sample_path)
+    exec_results: list[dict] = []
+
     try:
-        timeout_seconds = max(5, int(settings.sandbox_timeout_seconds))
-        sandbox_root = artifact_root / "sandbox" / f"job_{job_id}"
-        sandbox_root.mkdir(parents=True, exist_ok=True)
-
-        if not targets:
-            _append_stage(analysis_log_path, "dynamic_skip", reason="no executable members in archive")
-        for idx, target in enumerate(targets, start=1):
-            work_dir = sandbox_root / f"member_{idx}"
-            work_dir.mkdir(parents=True, exist_ok=True)
-            member_result = _execute_one(str(target), timeout_seconds, analysis_log_path, target.name, work_dir)
-            member_results.append({
-                "name": target.name,
-                "command": member_result.get("command", []),
-                "returncode": member_result.get("returncode", 0),
-                "timed_out": member_result.get("timed_out", False),
-                "stdout_preview": (member_result.get("stdout", "") or "")[:1200],
-                "stderr_preview": (member_result.get("stderr", "") or "")[:1200],
-                "strategy": member_result.get("strategy"),
-                "skipped": member_result.get("skipped", False),
-                "skip_reason": member_result.get("skip_reason"),
-            })
-            if member_result.get("timed_out"):
-                timed_out = True
-                returncode = -1
-            elif member_result.get("returncode", 0) != 0 and returncode == 0:
-                returncode = int(member_result.get("returncode", 0))
-            if member_result.get("skipped"):
-                skipped_count += 1
-            total_stdout_parts.append(member_result.get("stdout", ""))
-            total_stderr_parts.append(member_result.get("stderr", ""))
+        if sample.suffix.lower() == ".zip":
+            _safe_extract(sample, extract_dir)
+            for target in _list_exec_candidates(extract_dir):
+                result = _execute_one(str(target), int(settings.sample_timeout_seconds), analysis_log_path, "archive_member", work_dir)
+                result["path"] = str(target.relative_to(extract_dir))
+                exec_results.append(result)
+        else:
+            result = _execute_one(sample_path, int(settings.sample_timeout_seconds), analysis_log_path, "sample", work_dir)
+            result["path"] = sample.name
+            exec_results.append(result)
     finally:
-        stop_tcpdump(tcpdump_proc)
-        network_result = stop_network_capture(net_capture)
-        _append_stage(analysis_log_path, "dynamic_stop", network_signal=network_result.get("network_signal", False))
+        trace = stop_network_capture(capture)
+        if tcpdump_proc is not None:
+            stop_tcpdump(tcpdump_proc)
 
-    stdout = "\n\n".join([part for part in total_stdout_parts if part])
-    stderr = "\n\n".join([part for part in total_stderr_parts if part])
+    proc_after = _process_snapshot()
+    post_tree = snapshot_tree(artifact_root_path)
+    fs_delta = diff_snapshots(pre_tree, post_tree)
 
-    Path(stdout_path).write_text(stdout, encoding="utf-8", errors="ignore")
-    Path(stderr_path).write_text(stderr, encoding="utf-8", errors="ignore")
+    combined_stdout = "\n\n".join((r.get("stdout") or "") for r in exec_results).strip()
+    combined_stderr = "\n\n".join((r.get("stderr") or "") for r in exec_results).strip()
+    _write_preview(stdout_path, combined_stdout)
+    _write_preview(stderr_path, combined_stderr)
 
-    after_fs = snapshot_tree(artifact_root)
-    after_proc = _process_snapshot()
-    fs_delta = diff_snapshots(before_fs, after_fs)
-    proc_delta = {
-        "before_count": len(before_proc),
-        "after_count": len(after_proc),
-        "new_processes_estimate": max(0, len(after_proc) - len(before_proc)),
-    }
-    Path(proc_path).write_text(json.dumps(after_proc, ensure_ascii=False, indent=2), encoding="utf-8")
+    combined_preview = (combined_stdout + "\n" + combined_stderr).strip()[:4000]
+    archive_exec_count = len(exec_results)
+    archive_skipped_count = sum(1 for r in exec_results if r.get("skipped"))
+    exec_signal = any(not r.get("skipped") for r in exec_results)
+    persistence_signal = any("run" in (r.get("stderr") or "").lower() or "schtasks" in (r.get("stdout") or "").lower() for r in exec_results)
+    file_signal = bool(fs_delta.get("created") or fs_delta.get("changed") or fs_delta.get("deleted"))
+    network_signal = bool(trace.get("connections"))
 
-    runtime_result = _score_runtime_output(stdout, stderr, fs_delta, network_result)
-    return {
-        "returncode": returncode,
-        "timed_out": timed_out,
+    result = {
+        "returncode": max((int(r.get("returncode", 0)) for r in exec_results), default=0),
+        "timed_out": any(bool(r.get("timed_out")) for r in exec_results),
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
         "analysis_log_path": str(analysis_log_path),
-        "trace_path": str(network_trace_path),
-        "pcap_path": pcap_path if settings.enable_pcap else None,
+        "trace_path": trace.get("trace_path"),
+        "pcap_path": pcap_path,
         "filesystem_delta": fs_delta,
-        "process_delta": proc_delta,
-        "network_trace": network_result,
-        "network_signal": runtime_result["network_signal"],
-        "exec_signal": runtime_result["exec_signal"],
-        "persistence_signal": runtime_result["persistence_signal"],
-        "file_signal": runtime_result["file_signal"],
-        "archive_file_count": archive_file_count,
-        "archive_member_exec_count": len(member_results),
-        "archive_member_skipped_count": skipped_count,
-        "archive_member_results": member_results,
-        "combined_output_preview": runtime_result["combined_output_preview"],
-        "score": runtime_result["score"],
-        "analysis_state": "partial" if skipped_count else "complete",
+        "process_delta": {
+            "before_count": len(proc_before),
+            "after_count": len(proc_after),
+            "new_processes_estimate": max(0, len(proc_after) - len(proc_before)),
+        },
+        "network_trace": trace,
+        "network_signal": network_signal,
+        "exec_signal": exec_signal,
+        "persistence_signal": persistence_signal,
+        "file_signal": file_signal,
+        "archive_file_count": sum(1 for p in extract_dir.rglob("*") if p.is_file()) if extract_dir.exists() else 1,
+        "archive_member_exec_count": archive_exec_count,
+        "archive_member_skipped_count": archive_skipped_count,
+        "archive_member_results": [{
+            "path": r.get("path"),
+            "command": r.get("command"),
+            "returncode": r.get("returncode"),
+            "timed_out": r.get("timed_out"),
+            "stdout_preview": (r.get("stdout") or "")[:1200],
+            "stderr_preview": (r.get("stderr") or "")[:1200],
+            "strategy": r.get("strategy"),
+            "skipped": r.get("skipped"),
+            "skip_reason": r.get("skip_reason"),
+        } for r in exec_results],
+        "combined_output_preview": combined_preview,
+        "score": 0,
+        "analysis_state": "partial" if archive_skipped_count else "complete",
         "sandbox_profile": {
-            "memory_limit_mb": settings.sandbox_memory_limit_mb,
-            "file_size_limit_mb": settings.sandbox_file_size_limit_mb,
-            "max_processes": settings.sandbox_max_processes,
-            "drop_privileges": settings.sandbox_drop_privileges,
-            "disable_network": settings.sandbox_disable_network,
+            "backend": "local",
+            "network_disabled": bool(settings.sandbox_disable_network),
+            "drop_privileges": bool(settings.sandbox_drop_privileges),
+            "runtime_root": str(work_dir),
         },
     }
+
+    shutil.rmtree(work_dir, ignore_errors=True)
+    return result

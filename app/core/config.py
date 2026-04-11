@@ -1,8 +1,8 @@
-
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -30,6 +30,10 @@ class Settings(BaseSettings):
 
     max_upload_bytes: int = 25 * 1024 * 1024
     max_zip_total_uncompressed_bytes: int = 80 * 1024 * 1024
+    max_zip_entry_uncompressed_bytes: int = 20 * 1024 * 1024
+    max_zip_compression_ratio: float = 250.0
+    max_zip_depth_hint: int = 3
+    reject_encrypted_archives: bool = True
     allowed_upload_extensions: str = ".zip"
     allowed_upload_content_types: str = "application/zip,application/x-zip-compressed,multipart/x-zip"
 
@@ -37,11 +41,20 @@ class Settings(BaseSettings):
     sandbox_file_size_limit_mb: int = 32
     sandbox_max_processes: int = 16
     sandbox_drop_privileges: bool = True
-    sandbox_disable_network: bool = False
+    sandbox_disable_network: bool = True
     sandbox_network_sample_interval_ms: int = 250
+    sandbox_runtime_root: str = "/tmp/malware_sandbox"
+
+    sandbox_backend: str = "auto"
+    sandbox_bridge_url: str = "http://host.docker.internal:9080"
+    sandbox_vm_name: str = "analysis-win10"
+    sandbox_vm_snapshot: str = "clean"
+    sandbox_job_timeout_seconds: int = 180
+    sandbox_require_dynamic_success: bool = False
 
     verdict_clean_max: int = 19
     verdict_review_max: int = 39
     verdict_suspicious_max: int = 69
+
 
 settings = Settings()

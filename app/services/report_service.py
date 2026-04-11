@@ -9,7 +9,7 @@ from uuid import uuid4
 from app.core.config import settings
 from app.repository.report_store import get_report, save_report, update_report
 from app.services.dynamic_analysis_service import run_dynamic_analysis
-from app.services.scoring_service import calculate_score
+from app.services.scoring_service import assess_files, calculate_score
 from app.services.static_analysis_service import analyze_archive
 
 
@@ -42,10 +42,14 @@ def _build_evidence_bundle(static_results: list[dict], dynamic_result: dict, ver
             interesting_files.append({
                 "file": item.get("file"),
                 "severity": item.get("severity"),
-                "score": item.get("score"),
+                "score": item.get("final_score", item.get("score")),
+                "verdict": item.get("final_verdict", item.get("severity")),
+                "reverse_plan": item.get("reverse_plan", {}),
                 "summary_reasons": item.get("summary_reasons", [])[:5],
                 "tags": item.get("tags", [])[:10],
                 "yara_matches": [m for m in item.get("yara_matches", []) if not str(m).startswith("yara_error:")][:10],
+                "malware_type_tags": item.get("malware_type_tags", [])[:6],
+                "primary_malware_type": item.get("primary_malware_type"),
             })
     return {
         "top_reasons": verdict.get("evidence_reasons", [])[:10],
@@ -53,6 +57,8 @@ def _build_evidence_bundle(static_results: list[dict], dynamic_result: dict, ver
         "archive_member_results": dynamic_result.get("archive_member_results", [])[:20],
         "filesystem_changes": dynamic_result.get("filesystem_delta", {}),
         "network_trace": dynamic_result.get("network_trace", {}),
+        "timeline": dynamic_result.get("timeline", [])[:50],
+        "process_delta": dynamic_result.get("process_delta", {}),
         "iocs": iocs,
     }
 
@@ -74,7 +80,9 @@ def _base_payload(report_id: str, original_filename: str) -> dict:
         "timestamps": {"queued_at": _utc_now()},
         "static_result": {"files": [], "summary": {"file_count": 0, "high_confidence_files": 0, "high_severity_files": 0}},
         "dynamic_result": {},
-        "iocs": {"urls": [], "emails": [], "domains": [], "ips": [], "yara_matches": [], "suspected_families": []},
+        "iocs": {"urls": [], "emails": [], "domains": [], "ips": [], "yara_matches": [], "suspected_families": [], "malware_types": []},
+        "malware_type_tags": [],
+        "primary_malware_type": None,
     }
 
 
@@ -121,39 +129,29 @@ def process_report(report_id: str) -> dict:
 
     try:
         static_results = analyze_archive(sample_path)
-        try:
-            dynamic_result = run_dynamic_analysis(sample_path, report_id, artifact_root)
-        except Exception as exc:
-            dynamic_result = {
-                "returncode": 0,
-                "timed_out": False,
-                "filesystem_delta": {"created": [], "changed": [], "deleted": []},
-                "process_delta": {"before_count": 0, "after_count": 0, "new_processes_estimate": 0},
-                "network_trace": {"disabled": True, "reason": f"dynamic_analysis_error:{exc}"},
-                "network_signal": False,
-                "exec_signal": False,
-                "persistence_signal": False,
-                "file_signal": False,
-                "archive_file_count": 0,
-                "archive_member_exec_count": 0,
-                "archive_member_skipped_count": 0,
-                "archive_member_results": [],
-                "combined_output_preview": "",
-                "score": 0,
-                "analysis_state": "static_only",
-                "dynamic_error": str(exc),
-                "sandbox_profile": {},
-            }
-        verdict = calculate_score(static_results, dynamic_result)
+        dynamic_result = run_dynamic_analysis(sample_path, report_id, artifact_root)
 
-        suspected_families = sorted({fam for item in static_results for fam in item.get("suspected_family", [])})
+        if bool(settings.sandbox_require_dynamic_success):
+            exec_count = int(dynamic_result.get("archive_member_exec_count", 0) or 0)
+            analysis_state = str(dynamic_result.get("analysis_state", "")).lower()
+            if analysis_state == "static_only":
+                raise RuntimeError("dynamic_analysis_required_but_not_executed")
+            if exec_count <= 0 and not bool(dynamic_result.get("exec_signal")):
+                raise RuntimeError("dynamic_analysis_required_but_no_member_executed")
+
+        scored_files = assess_files(static_results, dynamic_result)
+        verdict = calculate_score(scored_files, dynamic_result)
+
+        suspected_families = sorted({fam for item in scored_files for fam in item.get("suspected_family", [])})
+        malware_types = sorted({m for item in scored_files for m in item.get("malware_type_tags", [])})
         iocs = {
-            "urls": sorted({u for item in static_results for u in item.get("iocs", {}).get("urls", [])})[:100],
-            "emails": sorted({e for item in static_results for e in item.get("iocs", {}).get("emails", [])})[:100],
-            "domains": sorted({d for item in static_results for d in item.get("iocs", {}).get("domains", [])})[:100],
-            "ips": sorted({ip for item in static_results for ip in item.get("iocs", {}).get("ips", [])})[:100],
-            "yara_matches": sorted({m for item in static_results for m in item.get("yara_matches", []) if not str(m).startswith("yara_error:")}),
+            "urls": sorted({u for item in scored_files for u in item.get("iocs", {}).get("urls", [])})[:100],
+            "emails": sorted({e for item in scored_files for e in item.get("iocs", {}).get("emails", [])})[:100],
+            "domains": sorted({d for item in scored_files for d in item.get("iocs", {}).get("domains", [])})[:100],
+            "ips": sorted({ip for item in scored_files for ip in item.get("iocs", {}).get("ips", [])})[:100],
+            "yara_matches": sorted({m for item in scored_files for m in item.get("yara_matches", []) if not str(m).startswith("yara_error:")}),
             "suspected_families": suspected_families,
+            "malware_types": malware_types,
         }
 
         final_status = "done"
@@ -192,15 +190,17 @@ def process_report(report_id: str) -> dict:
             "failure_reason": None,
             "timestamps": {**(current.get("timestamps") or {}), "started_at": started_at, "finished_at": _utc_now()},
             "static_result": {
-                "files": static_results,
+                "files": scored_files,
                 "summary": {
-                    "file_count": len(static_results),
+                    "file_count": len(scored_files),
                     "high_confidence_files": verdict.get("high_confidence_files", 0),
                     "high_severity_files": verdict.get("high_severity_files", 0),
                 },
             },
             "dynamic_result": dynamic_result,
             "iocs": iocs,
+            "malware_type_tags": verdict.get("malware_type_tags", []),
+            "primary_malware_type": verdict.get("primary_malware_type"),
             "evidence_bundle": evidence_bundle,
         }
         save_report(payload)

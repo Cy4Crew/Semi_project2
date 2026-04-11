@@ -14,7 +14,8 @@ from app.services.report_service import create_report_job
 router = APIRouter(prefix="/api/samples", tags=["samples"])
 
 _FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
+_DANGEROUS_ZIP_PARTS = {"..", ""}
+_NESTED_ARCHIVE_SUFFIXES = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".iso"}
 
 
 def _safe_upload_name(name: str | None) -> str:
@@ -23,7 +24,6 @@ def _safe_upload_name(name: str | None) -> str:
     if not candidate.lower().endswith(".zip"):
         candidate += ".zip"
     return candidate
-
 
 
 def _allowed_content_types() -> set[str]:
@@ -37,7 +37,6 @@ def _content_type_allowed(content_type: str) -> bool:
     if lowered in {"application/octet-stream", "binary/octet-stream"}:
         return True
     return lowered in _allowed_content_types()
-
 
 
 def _unique_sample_path(safe_name: str) -> Path:
@@ -54,6 +53,47 @@ def _unique_sample_path(safe_name: str) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+def _validate_zip_archive(sample_path: Path) -> None:
+    with zipfile.ZipFile(sample_path) as zf:
+        infos = zf.infolist()
+        file_count = 0
+        total_uncompressed = 0
+        nested_archive_count = 0
+
+        for info in infos:
+            name = info.filename or ""
+            normalized_parts = Path(name.replace("\\", "/")).parts
+            if Path(name).is_absolute() or any(part in _DANGEROUS_ZIP_PARTS for part in normalized_parts):
+                raise HTTPException(status_code=400, detail=f"Unsafe ZIP path detected: {name}")
+
+            if info.flag_bits & 0x1 and bool(settings.reject_encrypted_archives):
+                raise HTTPException(status_code=400, detail="Encrypted ZIP entries are not supported.")
+
+            if info.is_dir():
+                continue
+
+            file_count += 1
+            entry_size = int(info.file_size)
+            compressed_size = max(1, int(info.compress_size))
+            total_uncompressed += entry_size
+            ratio = entry_size / compressed_size
+
+            if file_count > int(settings.max_archive_files):
+                raise HTTPException(status_code=400, detail=f"ZIP contains too many files. Max {settings.max_archive_files}.")
+            if total_uncompressed > int(settings.max_zip_total_uncompressed_bytes):
+                raise HTTPException(status_code=400, detail=f"ZIP uncompressed size exceeds limit: {settings.max_zip_total_uncompressed_bytes} bytes.")
+            if entry_size > int(settings.max_zip_entry_uncompressed_bytes):
+                raise HTTPException(status_code=400, detail=f"ZIP entry too large: {name}")
+            if ratio > float(settings.max_zip_compression_ratio):
+                raise HTTPException(status_code=400, detail=f"ZIP entry compression ratio too high: {name}")
+
+            suffix = Path(name).suffix.lower()
+            if suffix in _NESTED_ARCHIVE_SUFFIXES:
+                nested_archive_count += 1
+                if nested_archive_count > int(settings.max_zip_depth_hint):
+                    raise HTTPException(status_code=400, detail="Too many nested archives inside ZIP.")
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -80,13 +120,7 @@ async def upload_sample(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Uploaded file is not a valid ZIP archive.")
 
     try:
-        with zipfile.ZipFile(sample_path) as zf:
-            file_count = sum(1 for info in zf.infolist() if not info.is_dir())
-            total_uncompressed = sum(int(info.file_size) for info in zf.infolist())
-            if file_count > settings.max_archive_files:
-                raise HTTPException(status_code=400, detail=f"ZIP contains too many files. Max {settings.max_archive_files}.")
-            if total_uncompressed > settings.max_zip_total_uncompressed_bytes:
-                raise HTTPException(status_code=400, detail=f"ZIP uncompressed size exceeds limit: {settings.max_zip_total_uncompressed_bytes} bytes.")
+        _validate_zip_archive(sample_path)
     except HTTPException:
         sample_path.unlink(missing_ok=True)
         raise

@@ -7,3 +7,5 @@ pefile==2024.8.26
 yara-python==4.5.1
 psutil==7.0.0
 python-magic==0.4.27
+
+requests==2.32.3
