@@ -1,0 +1,2 @@
+alert http any any -> any any (msg:"Sandbox suspicious HTTP user-agent"; flow:established,to_server; content:"User-Agent|3a|"; http.header_names; sid:1000001; rev:1;)
+alert tcp any any -> any 4444 (msg:"Sandbox possible C2 port 4444"; sid:1000002; rev:1;)

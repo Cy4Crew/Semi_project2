@@ -1,0 +1,1022 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import threading
+import time
+import traceback
+import zipfile
+from collections import deque
+
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+PE_DLL_CHARACTERISTIC = 0x2000
+from pathlib import Path
+
+import psutil
+
+WORK_DIR = Path(os.environ.get("VM_WORK_DIR", r"C:\sandbox_work")).resolve()
+POLL_SECONDS = int(os.environ.get("VM_AGENT_POLL_SECONDS", "3"))
+SHARED_DIR = Path(os.environ.get("VM_SHARED_DIR") or r"\\vmware-host\Shared Folders\shared")
+
+
+def _derive_candidate_paths(value: str) -> list[Path]:
+    value = str(value or "").strip()
+    if not value:
+        return []
+    paths: list[Path] = [Path(value)]
+    try:
+        leaf = Path(value).name
+    except Exception:
+        leaf = ""
+    if leaf:
+        paths.append(Path(rf"\\vmware-host\Shared Folders\{leaf}"))
+        paths.append(Path(rf"Z:\{leaf}"))
+    return paths
+
+
+def resolve_shared_dir() -> Path:
+    shared_name = (os.environ.get("VM_SHARED_DIR_NAME") or "").strip()
+    env_values = [
+        (os.environ.get("VM_SHARED_DIR") or "").strip(),
+        (os.environ.get("SHARED_DIR") or "").strip(),
+    ]
+    candidates: list[Path] = []
+    for value in env_values:
+        candidates.extend(_derive_candidate_paths(value))
+    if shared_name:
+        candidates.extend([
+            Path(rf"\\vmware-host\Shared Folders\{shared_name}"),
+            Path(rf"Z:\{shared_name}"),
+            Path(rf"C:\{shared_name}"),
+        ])
+    candidates.extend([
+        Path(r"\\vmware-host\Shared Folders\shared"),
+        Path(r"\\vmware-host\Shared Folders\sandbox_shared"),
+        Path(r"Z:\shared"),
+        Path(r"Z:\sandbox_shared"),
+        Path(r"C:\sandbox_shared"),
+    ])
+
+    preferred: list[Path] = []
+    fallback: list[Path] = []
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        preferred.append(candidate)
+
+    for candidate in preferred:
+        try:
+            if candidate.exists():
+                inbox = candidate / "inbox"
+                outbox = candidate / "outbox"
+                if inbox.exists() and outbox.exists():
+                    return candidate.resolve()
+        except Exception:
+            continue
+
+    for candidate in preferred:
+        try:
+            if candidate.exists():
+                fallback.append(candidate)
+        except Exception:
+            continue
+
+    if fallback:
+        try:
+            return fallback[0].resolve()
+        except Exception:
+            return fallback[0]
+
+    if preferred:
+        return preferred[0]
+    return Path(r"\\vmware-host\Shared Folders\shared")
+
+
+MAX_RECURSIVE_EXEC_TARGETS = int(os.environ.get("MAX_RECURSIVE_EXEC_TARGETS", "8"))
+MAX_RECURSIVE_EXEC_DEPTH = int(os.environ.get("MAX_RECURSIVE_EXEC_DEPTH", "2"))
+
+EXEC_SUFFIXES = {'.py', '.ps1', '.bat', '.cmd', '.exe', '.dll', '.js', '.vbs', '.docm', '.xlsm', '.doc', '.docx', '.xls', '.xlsx', '.lnk', '.pdf', '.zip'}
+EXEC_PRIORITY = {'.exe': 0, '.dll': 1, '.ps1': 2, '.bat': 3, '.cmd': 4, '.js': 5, '.vbs': 6, '.docm': 7, '.xlsm': 8, '.doc': 9, '.docx': 10, '.xls': 11, '.xlsx': 12, '.lnk': 13, '.pdf': 14, '.zip': 15, '.py': 16}
+SUSPICIOUS_PROCESS_MARKERS = {
+    "powershell", "pwsh", "cmd", "wscript", "cscript", "mshta", "rundll32", "regsvr32",
+    "schtasks", "certutil", "bitsadmin", "wmic", "msbuild", "installutil", "python"
+}
+PERSISTENCE_DIR_MARKERS = {
+    "appdata\\roaming\\microsoft\\windows\\start menu\\programs\\startup",
+    "programdata\\microsoft\\windows\\start menu\\programs\\startup",
+}
+DOCUMENT_SUFFIXES = {".docm", ".xlsm", ".doc", ".docx", ".xls", ".xlsx"}
+SCRIPT_SUFFIXES = {".ps1", ".bat", ".cmd", ".js", ".vbs", ".py"}
+BINARY_SUFFIXES = {".exe", ".dll", ".com", ".scr"}
+
+
+
+POPUP_KILL_INTERVAL_SECONDS = float(os.environ.get("POPUP_KILL_INTERVAL_SECONDS", "1.0"))
+POPUP_PROCESS_NAMES = tuple(
+    name.strip().lower()
+    for name in (os.environ.get("POPUP_PROCESS_NAMES") or "WerFault.exe,wermgr.exe,OpenWith.exe,rundll32.exe,regsvr32.exe,hh.exe,AcroRd32.exe,WINWORD.EXE,EXCEL.EXE").split(",")
+    if name.strip()
+)
+COMMON_LAUNCH_ERROR_MARKERS = (
+    "not a valid win32 application",
+    "not a valid application",
+    "error in starting program",
+    "unable to load",
+    "entry point",
+    "not found",
+    "is not recognized",
+    "wrong format",
+    "bad exe format",
+    "올바른 win32 응용 프로그램이 아닙니다",
+    "시작하는 동안 문제가 발생했습니다",
+)
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def append_timeline(timeline: list[dict], event: str, **extra) -> None:
+    payload = {"ts": utc_now(), "event": event}
+    payload.update(extra)
+    timeline.append(payload)
+
+
+def process_snapshot() -> list[dict]:
+    items = []
+    for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "exe", "create_time"]):
+        try:
+            info = proc.info
+            info["cmdline"] = info.get("cmdline") or []
+            items.append(info)
+        except Exception:
+            continue
+    return items[:800]
+
+
+def process_map(snapshot: list[dict]) -> dict[tuple[int, float], dict]:
+    mapped = {}
+    for item in snapshot:
+        key = (int(item.get("pid") or 0), float(item.get("create_time") or 0.0))
+        mapped[key] = item
+    return mapped
+
+
+def net_snapshot() -> list[dict]:
+    rows = []
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            raddr = getattr(conn, "raddr", None)
+            if not raddr:
+                continue
+            remote_ip = getattr(raddr, "ip", None) or (raddr[0] if isinstance(raddr, tuple) and len(raddr) > 0 else None)
+            remote_port = getattr(raddr, "port", None) or (raddr[1] if isinstance(raddr, tuple) and len(raddr) > 1 else None)
+            if not remote_ip:
+                continue
+            rows.append({
+                "pid": int(conn.pid or 0),
+                "status": str(conn.status),
+                "remote_ip": str(remote_ip),
+                "remote_port": int(remote_port or 0),
+            })
+    except Exception:
+        return []
+    return rows[:300]
+
+
+def safe_extract(zip_path: Path, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            target = (dest / member.filename).resolve()
+            if not str(target).startswith(str(dest.resolve())):
+                continue
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+
+def detect_package(path: Path) -> str:
+    suf = path.suffix.lower()
+    if suf in {'.docm', '.xlsm'}:
+        return 'office_macro'
+    if suf in {'.doc', '.docx', '.xls', '.xlsx'}:
+        return 'office_document'
+    if suf == '.dll':
+        return 'dll'
+    if suf == '.lnk':
+        return 'shortcut'
+    if suf == '.pdf':
+        return 'pdf'
+    if suf == '.zip':
+        return 'zip_recursive'
+    if suf in {'.js', '.vbs', '.ps1', '.bat', '.cmd', '.py'}:
+        return 'script'
+    if suf == '.exe':
+        return 'exe'
+    return 'generic'
+
+
+
+
+
+
+def _binary_contains_token(data: bytes, token: str) -> bool:
+    needle = token.encode("ascii", errors="ignore")
+    if needle and needle in data:
+        return True
+    try:
+        wide = token.encode("utf-16le")
+    except Exception:
+        return False
+    return bool(wide) and wide in data
+
+
+def _dll_has_export_name(path: Path, export_name: str) -> bool:
+    try:
+        data = path.read_bytes()[: 2 * 1024 * 1024]
+    except Exception:
+        return False
+    return _binary_contains_token(data, export_name)
+
+
+def _terminate_process_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+    try:
+        proc = psutil.Process(pid)
+    except Exception:
+        return
+    children = []
+    try:
+        children = proc.children(recursive=True)
+    except Exception:
+        children = []
+    for child in reversed(children):
+        try:
+            child.kill()
+        except Exception:
+            pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _kill_popup_processes_once() -> list[str]:
+    killed = []
+    target_names = set(POPUP_PROCESS_NAMES)
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            name = str(proc.info.get("name") or "").strip().lower()
+            if not name or name not in target_names:
+                continue
+            proc.kill()
+            killed.append(f"{name}:{proc.pid}")
+        except Exception:
+            continue
+    return killed
+
+
+def _start_popup_guard(stop_event: threading.Event, timeline: list[dict]) -> threading.Thread:
+    def _worker() -> None:
+        while not stop_event.is_set():
+            killed = _kill_popup_processes_once()
+            if killed:
+                append_timeline(timeline, "popup_guard_kill", killed=killed)
+            stop_event.wait(max(0.2, POPUP_KILL_INTERVAL_SECONDS))
+
+    thread = threading.Thread(target=_worker, name="popup_guard", daemon=True)
+    thread.start()
+    return thread
+
+
+def _stdout_stderr_preview(stdout: str, stderr: str) -> tuple[str, str]:
+    return (stdout or "")[:1200], (stderr or "")[:1200]
+
+
+def _detect_launch_error(stdout: str, stderr: str, command: list[str]) -> str | None:
+    lowered = "\n".join([stdout or "", stderr or "", " ".join(command or [])]).lower()
+    for marker in COMMON_LAUNCH_ERROR_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+def _classify_execution_outcome(path: Path, command: list[str], returncode: int, timed_out: bool, runtime_ms: int, stdout: str, stderr: str) -> tuple[bool, str | None]:
+    if timed_out:
+        return False, "timeout"
+    launch_error = _detect_launch_error(stdout, stderr, command)
+    if launch_error:
+        return False, f"launch_error:{launch_error}"
+    suffix = path.suffix.lower()
+    if suffix in SCRIPT_SUFFIXES:
+        if returncode == 0:
+            return True, None
+        if runtime_ms >= 1500 and not launch_error:
+            return True, None
+        return False, f"returncode_{returncode}"
+    if suffix == ".dll":
+        if returncode == 0 and runtime_ms >= 500:
+            return True, None
+        return False, f"returncode_{returncode}"
+    if suffix == ".exe":
+        if returncode == 0:
+            return True, None
+        if runtime_ms >= 2000 and not launch_error:
+            return True, None
+        return False, f"returncode_{returncode}"
+    if returncode == 0:
+        return True, None
+    return False, f"returncode_{returncode}"
+
+
+def _read_pe_info(path: Path) -> dict:
+    try:
+        with path.open('rb') as fp:
+            mz = fp.read(2)
+            if mz != b'MZ':
+                return {"is_pe": False, "is_dll": False, "machine": None}
+            fp.seek(0x3C)
+            pe_offset_bytes = fp.read(4)
+            if len(pe_offset_bytes) != 4:
+                return {"is_pe": False, "is_dll": False, "machine": None}
+            pe_offset = int.from_bytes(pe_offset_bytes, 'little', signed=False)
+            fp.seek(pe_offset)
+            if fp.read(4) != b'PE\x00\x00':
+                return {"is_pe": False, "is_dll": False, "machine": None}
+            machine = int.from_bytes(fp.read(2), 'little', signed=False)
+            fp.seek(18, 1)
+            characteristics = int.from_bytes(fp.read(2), 'little', signed=False)
+            return {
+                "is_pe": True,
+                "is_dll": bool(characteristics & PE_DLL_CHARACTERISTIC),
+                "machine": machine,
+                "characteristics": characteristics,
+            }
+    except Exception:
+        return {"is_pe": False, "is_dll": False, "machine": None}
+
+
+def preflight_execution(path: Path) -> tuple[bool, str | None, dict]:
+    suf = path.suffix.lower()
+    package = detect_package(path)
+    info = {"package": package, "suffix": suf}
+    if suf in {'.doc', '.docx', '.docm', '.xls', '.xlsx', '.xlsm', '.pdf', '.lnk'}:
+        return False, 'gui_launch_skipped', info
+    if suf == '.zip':
+        return False, 'archive_exec_skipped', info
+    if suf == '.exe':
+        pe = _read_pe_info(path)
+        info['pe'] = pe
+        if not pe.get('is_pe'):
+            return False, 'invalid_pe_exe', info
+        if pe.get('is_dll'):
+            return False, 'exe_is_dll_image', info
+    if suf == '.dll':
+        pe = _read_pe_info(path)
+        info['pe'] = pe
+        if not pe.get('is_pe'):
+            return False, 'invalid_pe_dll', info
+        if not pe.get('is_dll'):
+            return False, 'not_a_dll_image', info
+        has_entry = _dll_has_export_name(path, 'DllRegisterServer')
+        info['dll_register_server_export'] = has_entry
+        if not has_entry:
+            return False, 'dll_entrypoint_missing', info
+    return True, None, info
+
+
+def build_command(path: Path) -> tuple[list[str] | None, str]:
+    package = detect_package(path)
+    suf = path.suffix.lower()
+    if suf == '.py':
+        return ["python", str(path)], package
+    if suf == '.ps1':
+        return ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(path)], package
+    if suf in {'.bat', '.cmd'}:
+        return ["cmd", "/c", str(path)], package
+    if suf == '.js':
+        return ["wscript", "//B", str(path)], package
+    if suf == '.vbs':
+        return ["cscript", "//B", str(path)], package
+    if suf == '.exe':
+        return [str(path)], package
+    if suf == '.dll':
+        return ["rundll32.exe", str(path) + ",DllRegisterServer"], package
+    if suf in {'.docm', '.doc', '.docx'}:
+        return None, package
+    if suf in {'.xlsm', '.xls', '.xlsx'}:
+        return None, package
+    if suf == '.pdf':
+        return None, package
+    if suf == '.lnk':
+        return None, package
+    return None, package
+
+
+def classify_created_file(path_str: str) -> str:
+    suffix = Path(path_str).suffix.lower()
+    lowered = path_str.lower()
+    if suffix in BINARY_SUFFIXES:
+        return "binary_drop"
+    if suffix in SCRIPT_SUFFIXES:
+        return "script_drop"
+    if suffix in DOCUMENT_SUFFIXES:
+        return "document_drop"
+    if any(marker in lowered for marker in PERSISTENCE_DIR_MARKERS):
+        return "startup_drop"
+    return "other_drop"
+
+
+def expand_nested_archives(extract_dir: Path, depth_limit: int = 2) -> None:
+    archives = [p for p in extract_dir.rglob('*.zip') if p.is_file()]
+    seen = set()
+    depth = 0
+    while archives and depth < depth_limit:
+        current = archives.pop(0)
+        key = str(current.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        nested_dir = current.parent / (current.stem + '_unzipped')
+        try:
+            safe_extract(current, nested_dir)
+            for child in nested_dir.rglob('*.zip'):
+                if child.is_file():
+                    archives.append(child)
+        except Exception:
+            pass
+        depth += 1
+
+
+def rank_targets(extract_dir: Path) -> list[Path]:
+    expand_nested_archives(extract_dir, depth_limit=2)
+    targets = [p for p in extract_dir.rglob('*') if p.is_file() and p.suffix.lower() in EXEC_SUFFIXES]
+    targets.sort(key=lambda p: (EXEC_PRIORITY.get(p.suffix.lower(), 20), str(p).lower()))
+    return targets[:8]
+
+
+def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[dict], extract_dir: Path) -> dict:
+    command, package = build_command(path)
+    rel_path = str(path.relative_to(extract_dir)).replace("\\", "/")
+
+    if not command:
+        return {
+            "name": path.name,
+            "path": rel_path,
+            "skipped": True,
+            "skip_reason": "unsupported_extension",
+            "fail_reason": "not_executable",
+            "package": package,
+        }
+
+    append_timeline(timeline, "member_start", member=str(path), command=command, package=package)
+    started = time.time()
+
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            cwd=str(path.parent),
+            creationflags=CREATE_NO_WINDOW,
+        )
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        (out_dir / f"{path.stem}_stdout.txt").write_text(stdout, encoding="utf-8", errors="ignore")
+        (out_dir / f"{path.stem}_stderr.txt").write_text(stderr, encoding="utf-8", errors="ignore")
+
+        append_timeline(
+            timeline,
+            "member_end",
+            member=str(path),
+            returncode=proc.returncode,
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+        text_l = (stdout + "\n" + stderr + "\n" + " ".join(command)).lower()
+        behavior = {
+            "network_signal": any(m in text_l for m in ["http://", "https://", "ftp://", "downloadstring", "invoke-webrequest", "urlmon", "bitsadmin", "certutil -urlcache"]),
+            "persistence_signal": any(m in text_l for m in ["currentversion\\run", "runonce", "schtasks", "startup", "reg add"]),
+            "ransomware_signal": any(m in text_l for m in ["vssadmin", "wbadmin", "bcdedit", "ransom", "decrypt"]),
+            "execution_signal": any(m in text_l for m in ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript"]),
+        }
+
+        return {
+            "name": path.name,
+            "path": rel_path,
+            "command": command,
+            "returncode": proc.returncode,
+            "timed_out": False,
+            "stdout_preview": stdout[:1200],
+            "stderr_preview": stderr[:1200],
+            "strategy": "guest_native",
+            "behavior": behavior,
+            "skipped": False,
+            "package": package,
+        }
+
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        append_timeline(timeline, "member_timeout", member=str(path), duration_ms=int((time.time() - started) * 1000))
+
+        text_l = (stdout + "\n" + stderr + "\n" + " ".join(command)).lower()
+        behavior = {
+            "network_signal": any(m in text_l for m in ["http://", "https://", "ftp://", "downloadstring", "invoke-webrequest", "urlmon", "bitsadmin", "certutil -urlcache"]),
+            "persistence_signal": any(m in text_l for m in ["currentversion\\run", "runonce", "schtasks", "startup", "reg add"]),
+            "ransomware_signal": any(m in text_l for m in ["vssadmin", "wbadmin", "bcdedit", "ransom", "decrypt"]),
+            "execution_signal": any(m in text_l for m in ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript"]),
+        }
+
+        return {
+            "name": path.name,
+            "path": rel_path,
+            "command": command,
+            "returncode": -1,
+            "timed_out": True,
+            "stdout_preview": stdout[:1200],
+            "stderr_preview": stderr[:1200],
+            "strategy": "guest_native",
+            "behavior": behavior,
+            "skipped": False,
+            "fail_reason": "timeout",
+            "package": package,
+        }
+
+    except Exception as exc:
+        append_timeline(timeline, "member_error", member=str(path), error=str(exc))
+        return {
+            "name": path.name,
+            "path": rel_path,
+            "skipped": True,
+            "skip_reason": str(exc),
+            "strategy": "guest_native",
+            "fail_reason": "execution_failed",
+            "package": package,
+        }
+
+
+
+
+def maybe_capture_memory_dump(proc_items: list[dict], outbox: Path, timeline: list[dict]) -> list[dict]:
+    procdump = os.environ.get("PROCDUMP_PATH", r"C:\Tools\Sysinternals\procdump64.exe")
+    if not Path(procdump).exists():
+        return []
+    dumps = []
+    for item in proc_items[:5]:
+        pid = int(item.get("pid") or 0)
+        name = str(item.get("name") or "")
+        if pid <= 0:
+            continue
+        dump_path = outbox / f"{pid}_{name}.dmp"
+        try:
+            subprocess.run([procdump, "-accepteula", "-ma", str(pid), str(dump_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+            if dump_path.exists():
+                dumps.append({"pid": pid, "name": name, "path": str(dump_path)})
+                append_timeline(timeline, "memory_dump", pid=pid, path=str(dump_path))
+        except Exception:
+            continue
+    return dumps
+
+
+def collect_external_monitor_logs(outbox: Path, timeline: list[dict]) -> dict:
+    monitor_dir = Path(os.environ.get("MONITOR_LOGS_DIR", r"C:\analysis\monitor"))
+    if not monitor_dir.exists():
+        return {"enabled": False, "reason": "monitor_dir_missing", "events": []}
+    events = []
+    for path in sorted(monitor_dir.glob("*.json"))[:10]:
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+            events.append({"file": str(path), "preview": raw[:2000]})
+            shutil.copy2(path, outbox / path.name)
+        except Exception:
+            continue
+    append_timeline(timeline, "external_monitor_logs", count=len(events))
+    return {"enabled": True, "reason": None, "events": events[:20]}
+def summarize_process_delta(before_proc: list[dict], after_proc: list[dict]) -> dict:
+    before_map = process_map(before_proc)
+    after_map = process_map(after_proc)
+    new_items = [v for k, v in after_map.items() if k not in before_map]
+
+    suspicious = []
+    tree = []
+
+    for item in new_items[:60]:
+        name = str(item.get("name") or "")
+        cmdline = " ".join(item.get("cmdline") or [])
+        lowered = f"{name} {cmdline}".lower()
+        if any(marker in lowered for marker in SUSPICIOUS_PROCESS_MARKERS):
+            suspicious.append({"pid": item.get("pid"), "name": name, "cmdline": cmdline[:300]})
+        tree.append({"pid": item.get("pid"), "ppid": item.get("ppid"), "name": name, "cmdline": cmdline[:300]})
+
+    return {
+        "before_count": len(before_proc),
+        "after_count": len(after_proc),
+        "new_processes_estimate": max(0, len(after_proc) - len(before_proc)),
+        "new_process_tree": tree[:40],
+        "suspicious_processes": suspicious[:20],
+    }
+
+
+def summarize_network_delta(before_net: list[dict], after_net: list[dict]) -> dict:
+    before_keys = {(r["pid"], r["remote_ip"], r["remote_port"]) for r in before_net}
+    after_rows = [r for r in after_net if (r["pid"], r["remote_ip"], r["remote_port"]) not in before_keys]
+    endpoints = []
+    for row in after_rows[:40]:
+        endpoints.append({
+            "pid": row["pid"],
+            "remote_ip": row["remote_ip"],
+            "remote_port": row["remote_port"],
+            "status": row["status"],
+        })
+    return {
+        "endpoints": endpoints,
+        "connection_count": len(endpoints),
+        "disabled": False,
+        "reason": None,
+    }
+
+
+def collect_registry_snapshot() -> dict[str, list[str]]:
+    roots = {
+        "run": r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+        "runonce": r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        "run_hklm": r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+    }
+    result: dict[str, list[str]] = {}
+    for key, reg_path in roots.items():
+        try:
+            proc = subprocess.run(["reg", "query", reg_path], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+            lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+            result[key] = lines[:200]
+        except Exception:
+            result[key] = []
+    return result
+
+
+def collect_scheduled_tasks() -> list[str]:
+    try:
+        proc = subprocess.run(["schtasks", "/query", "/fo", "LIST", "/v"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip().startswith("TaskName:")][:300]
+    except Exception:
+        return []
+
+
+def collect_services_snapshot() -> list[str]:
+    try:
+        proc = subprocess.run(["sc", "query", "state=", "all"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip().startswith("SERVICE_NAME:")][:400]
+    except Exception:
+        return []
+
+
+def diff_named_items(before: list[str], after: list[str]) -> dict:
+    before_set = set(before)
+    after_set = set(after)
+    return {"added": sorted(after_set - before_set)[:100], "removed": sorted(before_set - after_set)[:100]}
+
+
+def diff_registry_snapshot(before: dict[str, list[str]], after: dict[str, list[str]]) -> dict:
+    added = []
+    removed = []
+    for key in sorted(set(before) | set(after)):
+        before_set = set(before.get(key) or [])
+        after_set = set(after.get(key) or [])
+        for item in sorted(after_set - before_set)[:50]:
+            added.append({"hive": key, "entry": item})
+        for item in sorted(before_set - after_set)[:50]:
+            removed.append({"hive": key, "entry": item})
+    return {"added": added[:100], "removed": removed[:100]}
+
+
+def analyze_job(job_dir: Path) -> dict:
+    report_id = job_dir.name
+    outbox = SHARED_DIR / "outbox" / report_id
+    outbox.mkdir(parents=True, exist_ok=True)
+
+    meta_path = job_dir / "job.json"
+    if not meta_path.exists():
+        raise Exception(f"job.json not found: {meta_path}")
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    sample_name = meta.get("sample_name")
+    if not sample_name:
+        raise Exception(f"sample_name missing in job.json: {meta}")
+
+    timeout_seconds = int(meta.get("timeout_seconds", 180))
+    sample_path = job_dir / sample_name
+    if not sample_path.exists():
+        raise Exception(f"sample file not found: {sample_path}")
+
+    guest_job_root = WORK_DIR / report_id
+    timeline: list[dict] = []
+    append_timeline(timeline, "job_begin", report_id=report_id, sample_name=sample_name)
+
+    if guest_job_root.exists():
+        shutil.rmtree(guest_job_root, ignore_errors=True)
+    guest_job_root.mkdir(parents=True, exist_ok=True)
+
+    extract_dir = guest_job_root / "extract"
+    artifact_dir = guest_job_root / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    before_files = {str(p.relative_to(guest_job_root)) for p in guest_job_root.rglob("*") if p.is_file()}
+    before_proc = process_snapshot()
+    before_net = net_snapshot()
+    before_registry = collect_registry_snapshot()
+    before_tasks = collect_scheduled_tasks()
+    before_services = collect_services_snapshot()
+
+    if sample_path.suffix.lower() == ".zip":
+        safe_extract(sample_path, extract_dir)
+    else:
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sample_path, extract_dir / sample_path.name)
+
+    append_timeline(timeline, "extract_complete", file_count=sum(1 for p in extract_dir.rglob("*") if p.is_file()))
+
+    queue: deque[tuple[Path, int, str | None]] = deque()
+    seen_targets: set[str] = set()
+    member_results: list[dict] = []
+
+    for target in rank_targets(extract_dir):
+        queue.append((target, 0, None))
+
+    append_timeline(
+        timeline,
+        "execution_plan",
+        targets=[str(p.relative_to(extract_dir)) for p, _, _ in list(queue)],
+        packages=[detect_package(p) for p, _, _ in list(queue)],
+    )
+
+    while queue and len(member_results) < MAX_RECURSIVE_EXEC_TARGETS:
+        target, depth, parent_path = queue.popleft()
+        key = str(target.resolve())
+        if key in seen_targets:
+            continue
+        seen_targets.add(key)
+
+        result = run_member(target, timeout_seconds, artifact_dir, timeline, extract_dir)
+        result["recursive_depth"] = depth
+        result["parent_path"] = parent_path
+        member_results.append(result)
+
+        time.sleep(1)
+        current_files = {str(p.relative_to(guest_job_root)) for p in guest_job_root.rglob("*") if p.is_file()}
+        created_now = sorted(current_files - before_files)
+        new_exec_candidates = []
+        for rel in created_now:
+            abs_path = guest_job_root / rel
+            if not abs_path.exists() or not abs_path.is_file():
+                continue
+            if abs_path.suffix.lower() not in EXEC_SUFFIXES:
+                continue
+            if str(abs_path.resolve()) in seen_targets:
+                continue
+            new_exec_candidates.append(abs_path)
+        if depth < MAX_RECURSIVE_EXEC_DEPTH:
+            for child in new_exec_candidates[:4]:
+                queue.append((child, depth + 1, str(target)))
+                append_timeline(timeline, "recursive_enqueue", child=str(child), parent=str(target), depth=depth + 1)
+
+    time.sleep(2)
+
+    after_files = {str(p.relative_to(guest_job_root)) for p in guest_job_root.rglob("*") if p.is_file()}
+    after_proc = process_snapshot()
+    after_net = net_snapshot()
+    after_registry = collect_registry_snapshot()
+    after_tasks = collect_scheduled_tasks()
+    after_services = collect_services_snapshot()
+
+    created = sorted(after_files - before_files)
+    created_details = [{"path": p, "category": classify_created_file(p)} for p in created[:200]]
+    dropped_exec_candidates = [c for c in created_details if Path(c["path"]).suffix.lower() in EXEC_SUFFIXES]
+
+    process_delta = summarize_process_delta(before_proc, after_proc)
+    network_trace = summarize_network_delta(before_net, after_net)
+    memory_dumps = maybe_capture_memory_dump(process_delta.get("suspicious_processes", []), outbox, timeline)
+    external_monitor = collect_external_monitor_logs(outbox, timeline)
+
+    registry_diff = diff_registry_snapshot(before_registry, after_registry)
+    scheduled_task_diff = diff_named_items(before_tasks, after_tasks)
+    service_diff = diff_named_items(before_services, after_services)
+
+    combined = "\n\n".join(
+        (m.get("stdout_preview", "") + "\n" + m.get("stderr_preview", "")).strip()
+        for m in member_results
+        if not m.get("skipped")
+    )
+    combined_l = combined.lower()
+    created_lower = "\n".join(c["path"].lower() for c in created_details)
+
+    exec_signal = bool(process_delta["suspicious_processes"]) or any(k in combined_l for k in ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript"])
+    persistence_signal = (
+        any(k in combined_l for k in [r"currentversion\run", "runonce", "schtasks", "startup"])
+        or any("startup_drop" == c["category"] for c in created_details)
+        or bool(scheduled_task_diff.get("added"))
+        or bool(service_diff.get("added"))
+        or bool(registry_diff.get("added"))
+        or "scheduledtasks" in created_lower
+    )
+    file_signal = bool(created_details)
+    network_signal = bool(network_trace["endpoints"]) or any(k in combined_l for k in ["http://", "https://", "ftp://"])
+    ransomware_signal = any(k in combined_l for k in ["vssadmin", "wbadmin", "bcdedit", "ransom", "decrypt"])
+    note_signal = any(Path(c["path"]).suffix.lower() == ".txt" and ("readme" in c["path"].lower() or "decrypt" in c["path"].lower()) for c in created_details)
+
+    score = 0
+    if exec_signal:
+        score += 20
+    if persistence_signal:
+        score += 25
+    if file_signal:
+        score += min(20, 4 + len(created_details) // 2)
+    if network_signal:
+        score += 20
+    if process_delta["suspicious_processes"]:
+        score += min(10, len(process_delta["suspicious_processes"]) * 2)
+    if ransomware_signal or note_signal:
+        score += 25
+    if dropped_exec_candidates:
+        score += min(10, len(dropped_exec_candidates) * 2)
+    score = min(score, 100)
+
+    append_timeline(
+        timeline,
+        "job_end",
+        created_files=len(created_details),
+        suspicious_processes=len(process_delta["suspicious_processes"]),
+        network_connections=len(network_trace["endpoints"]),
+        recursive_targets=sum(1 for m in member_results if int(m.get("recursive_depth") or 0) > 0),
+    )
+
+    package_counts = {}
+    for item in member_results:
+        pkg = str(item.get('package') or 'generic')
+        package_counts[pkg] = package_counts.get(pkg, 0) + 1
+
+    result = {
+        "returncode": 0 if all(not m.get("timed_out") for m in member_results) else -1,
+        "timed_out": any(m.get("timed_out") for m in member_results if m.get("attempted")),
+        "filesystem_delta": {
+            "created": created[:200],
+            "changed": [],
+            "deleted": [],
+            "created_details": created_details,
+        },
+        "process_delta": process_delta,
+        "network_trace": network_trace,
+        "network_signal": network_signal,
+        "exec_signal": exec_signal,
+        "persistence_signal": persistence_signal,
+        "file_signal": file_signal,
+        "ransomware_signal": ransomware_signal or note_signal,
+        "archive_file_count": sum(1 for p in extract_dir.rglob("*") if p.is_file()),
+        "archive_member_attempted_count": sum(1 for m in member_results if m.get("attempted")),
+        "archive_member_exec_count": sum(1 for m in member_results if m.get("succeeded")),
+        "archive_member_failed_count": sum(1 for m in member_results if m.get("failed")),
+        "archive_member_skipped_count": sum(1 for m in member_results if m.get("skipped")),
+        "archive_member_results": member_results,
+        "combined_output_preview": combined[:4000],
+        "score": score,
+        "analysis_state": "complete" if member_results else "static_only",
+        "timeline": timeline,
+        "memory_dumps": memory_dumps,
+        "api_activity": external_monitor,
+        "package_counts": package_counts,
+        "registry_diff": registry_diff,
+        "scheduled_tasks": scheduled_task_diff,
+        "services": service_diff,
+        "recursive_exec": {
+            "enabled": True,
+            "max_depth": MAX_RECURSIVE_EXEC_DEPTH,
+            "attempted_count": sum(1 for m in member_results if m.get("attempted")),
+        "executed_count": sum(1 for m in member_results if m.get("succeeded")),
+        "failed_count": sum(1 for m in member_results if m.get("failed")),
+            "recursive_executed_count": sum(1 for m in member_results if int(m.get("recursive_depth") or 0) > 0),
+            "dropped_exec_candidates": dropped_exec_candidates[:50],
+        },
+    }
+
+    (outbox / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
+
+
+def ensure_shared_layout(shared_dir: Path) -> None:
+    if not shared_dir.exists():
+        raise FileNotFoundError(f"shared dir not found: {shared_dir}")
+    if not shared_dir.is_dir():
+        raise NotADirectoryError(f"shared dir is not a directory: {shared_dir}")
+    (shared_dir / "inbox").mkdir(exist_ok=True)
+    (shared_dir / "outbox").mkdir(exist_ok=True)
+
+
+def build_heartbeat(shared_dir: Path, status: str, report_id: str | None = None, error: str | None = None) -> dict:
+    inbox = shared_dir / "inbox"
+    outbox = shared_dir / "outbox"
+    payload = {
+        "ts": time.time(),
+        "status": status,
+        "hostname": os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "guest",
+        "resolved_shared_dir": str(shared_dir),
+        "resolved_shared_dir_name": shared_dir.name,
+        "shared_dir_exists": shared_dir.exists(),
+        "shared_dir_ready": shared_dir.exists() and shared_dir.is_dir(),
+        "inbox_ready": inbox.exists(),
+        "outbox_ready": outbox.exists(),
+    }
+    if report_id:
+        payload["report_id"] = report_id
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def write_heartbeat(shared_dir: Path, status: str, report_id: str | None = None, error: str | None = None) -> None:
+    heartbeat_path = shared_dir / "agent_heartbeat.json"
+    heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat_path.write_text(json.dumps(build_heartbeat(shared_dir, status, report_id=report_id, error=error), ensure_ascii=False), encoding="utf-8")
+
+
+def write_failed_result(out_result: Path, exc: Exception) -> None:
+    out_result.parent.mkdir(parents=True, exist_ok=True)
+    error_detail = {
+        "returncode": -1,
+        "timed_out": False,
+        "analysis_state": "failed",
+        "error": str(exc),
+        "traceback": traceback.format_exc(),
+    }
+    out_result.write_text(json.dumps(error_detail, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def main() -> int:
+    global SHARED_DIR
+
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    last_shared_dir: str | None = None
+    last_wait_error: str | None = None
+
+    while True:
+        try:
+            SHARED_DIR = resolve_shared_dir()
+            ensure_shared_layout(SHARED_DIR)
+            current_shared_dir = str(SHARED_DIR)
+            if current_shared_dir != last_shared_dir:
+                print(f"guest_agent watching {SHARED_DIR}")
+                print(f"guest_agent inbox={(SHARED_DIR / 'inbox')}")
+                print(f"guest_agent outbox={(SHARED_DIR / 'outbox')}")
+                print(f"guest_agent VM_SHARED_DIR={os.environ.get('VM_SHARED_DIR', '')}")
+                print(f"guest_agent VM_SHARED_DIR_NAME={os.environ.get('VM_SHARED_DIR_NAME', '')}")
+                print(f"guest_agent SHARED_DIR={os.environ.get('SHARED_DIR', '')}")
+                last_shared_dir = current_shared_dir
+            write_heartbeat(SHARED_DIR, "idle")
+            last_wait_error = None
+        except Exception as exc:
+            message = str(exc)
+            if message != last_wait_error:
+                print(f"guest_agent shared folder wait: {message}")
+                last_wait_error = message
+            time.sleep(POLL_SECONDS)
+            continue
+
+        for job_dir in (SHARED_DIR / "inbox").iterdir():
+            if not job_dir.is_dir():
+                continue
+            if not (job_dir / "job.json").exists():
+                continue
+
+            out_result = SHARED_DIR / "outbox" / job_dir.name / "result.json"
+            if out_result.exists():
+                continue
+
+            try:
+                write_heartbeat(SHARED_DIR, "busy", report_id=job_dir.name)
+                analyze_job(job_dir)
+                write_heartbeat(SHARED_DIR, "idle", report_id=job_dir.name)
+            except Exception as exc:
+                write_failed_result(out_result, exc)
+                try:
+                    write_heartbeat(SHARED_DIR, "idle", report_id=job_dir.name, error=str(exc))
+                except Exception:
+                    pass
+
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

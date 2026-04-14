@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }}</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1220;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --line: #334155;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --good: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --idle: #64748b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: linear-gradient(180deg, #0b1220 0%, #111827 100%);
+      color: var(--text);
+      padding: 24px;
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    .page { max-width: 1440px; margin: 0 auto; }
+    .header { display:flex; justify-content:space-between; align-items:flex-end; gap:16px; margin-bottom:20px; }
+    .muted { color: var(--muted); }
+    .grid { display:grid; grid-template-columns: 1.1fr 0.9fr; gap:16px; }
+    .stack { display:grid; gap:16px; }
+    .card {
+      background: rgba(17,24,39,.92);
+      border: 1px solid rgba(148,163,184,.15);
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.22);
+    }
+    .controls, .toolbar, .inline { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    input, select, button {
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: #0f172a;
+      color: var(--text);
+      min-height: 40px;
+    }
+    input, select { min-width: 120px; }
+    button {
+      cursor: pointer;
+      background: #172554;
+      border-color: #1d4ed8;
+    }
+    button:hover { filter: brightness(1.08); }
+    button.secondary { background: #0f172a; border-color: var(--line); }
+    .statusbar {
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:12px;
+      margin-top:12px;
+      padding: 12px 14px;
+      background: rgba(15,23,42,.95);
+      border: 1px solid rgba(148,163,184,.12);
+      border-radius: 12px;
+    }
+    .pill {
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(148,163,184,.18);
+      background: #0f172a;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .pill::before {
+      content: '';
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--idle);
+      display:inline-block;
+    }
+    .pill.queued::before { background: var(--warn); }
+    .pill.running::before { background: var(--accent); }
+    .pill.done::before { background: var(--good); }
+    .pill.failed::before, .pill.timeout::before, .pill.killed::before { background: var(--bad); }
+    .metric-grid {
+      display:grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap:10px;
+      margin-top: 12px;
+    }
+    .metric {
+      background: #0f172a;
+      border: 1px solid rgba(148,163,184,.12);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .metric .value { font-size: 20px; font-weight: 700; }
+    .report-list {
+      margin-top: 12px;
+      border: 1px solid rgba(148,163,184,.12);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    table { width:100%; border-collapse: collapse; }
+    th, td {
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 1px solid rgba(148,163,184,.10);
+      font-size: 14px;
+      vertical-align: top;
+    }
+    thead th {
+      background: rgba(15,23,42,.95);
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    tbody tr:hover { background: rgba(30,41,59,.55); }
+    .report-row-active { background: rgba(30,41,59,.75); }
+    .links { display:flex; flex-wrap:wrap; gap:8px; }
+    a { color: #7dd3fc; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    pre {
+      margin: 12px 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #020617;
+      border: 1px solid rgba(148,163,184,.12);
+      padding: 14px;
+      border-radius: 12px;
+      max-height: 520px;
+      overflow: auto;
+    }
+    .section-title { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom: 8px; }
+    .small { font-size: 12px; }
+    @media (max-width: 1080px) {
+      .grid { grid-template-columns: 1fr; }
+      .metric-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div>
+        <h1>{{ app_name }}</h1>
+        <p class="muted">Build {{ build_id }} · bridge {{ bridge_url }}</p>
+      </div>
+      <div class="pill" id="autoRefreshPill">auto refresh on</div>
+    </div>
+
+    <div class="grid">
+      <div class="stack">
+        <div class="card">
+          <div class="section-title">
+            <h2>Upload sample</h2>
+            <button id="clearSelectionBtn" class="secondary" type="button">Clear selection</button>
+          </div>
+          <form id="uploadForm" class="controls">
+            <input id="fileInput" name="file" type="file" required>
+            <button type="submit">Analyze</button>
+          </form>
+          <div class="statusbar">
+            <div>
+              <div class="small muted">Current report</div>
+              <div id="activeReportLabel">No active report</div>
+            </div>
+            <div class="pill idle" id="statusPill">idle</div>
+          </div>
+          <pre id="resultBox">No result yet.</pre>
+        </div>
+
+        <div class="card">
+          <div class="section-title">
+            <h2>Recent reports</h2>
+            <div class="toolbar">
+              <button id="filterBtn" type="button">Refresh</button>
+            </div>
+          </div>
+          <div class="controls">
+            <input id="filterQ" placeholder="Search">
+            <select id="filterVerdict"><option value="">All verdicts</option><option>clean</option><option>review</option><option>suspicious</option><option>malicious</option></select>
+            <select id="filterStatus"><option value="">All statuses</option><option>queued</option><option>running</option><option>done</option><option>failed</option><option>timeout</option><option>killed</option></select>
+          </div>
+          <div class="report-list">
+            <table>
+              <thead><tr><th>ID</th><th>Status</th><th>Verdict</th><th>Score</th><th>File</th><th>Actions</th></tr></thead>
+              <tbody id="reportsBody"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="card">
+          <div class="section-title">
+            <h2>Operations</h2>
+            <span class="small muted" id="opsUpdatedAt">Updating…</span>
+          </div>
+          <div class="metric-grid">
+            <div class="metric"><div class="label">Queued</div><div class="value" id="metricQueued">0</div></div>
+            <div class="metric"><div class="label">Running</div><div class="value" id="metricRunning">0</div></div>
+            <div class="metric"><div class="label">Finished</div><div class="value" id="metricFinished">0</div></div>
+          </div>
+          <pre id="opsBox">Loading…</pre>
+        </div>
+
+        <div class="card">
+          <div class="section-title">
+            <h2>Compare reports</h2>
+          </div>
+          <div class="controls">
+            <input id="compareA" placeholder="Left report id">
+            <input id="compareB" placeholder="Right report id">
+            <button id="compareBtn" type="button">Compare</button>
+          </div>
+          <pre id="compareBox">No comparison yet.</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+let activeReportId = null;
+let reportPollTimer = null;
+let dashboardTimer = null;
+let isPollingReport = false;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function getJson(url, options) {
+  const res = await fetch(url, options || { cache: 'no-store' });
+  const text = await res.text();
+  try { return { ok: res.ok, data: JSON.parse(text), status: res.status }; }
+  catch { return { ok: res.ok, data: text, status: res.status }; }
+}
+
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+function setStatus(status, reportId) {
+  const normalized = String(status || 'idle').toLowerCase();
+  const pill = document.getElementById('statusPill');
+  pill.className = `pill ${normalized}`;
+  pill.textContent = normalized;
+  document.getElementById('activeReportLabel').textContent = reportId ? `${reportId}` : 'No active report';
+}
+
+function getTerminalStatus(status) {
+  return ['done', 'failed', 'timeout', 'killed'].includes(String(status || '').toLowerCase());
+}
+
+function setResultBox(data) {
+  document.getElementById('resultBox').textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+}
+
+async function refreshReports() {
+  const q = encodeURIComponent(document.getElementById('filterQ').value || '');
+  const verdict = encodeURIComponent(document.getElementById('filterVerdict').value || '');
+  const status = encodeURIComponent(document.getElementById('filterStatus').value || '');
+  const parsed = await getJson(`/api/reports/?q=${q}&verdict=${verdict}&status=${status}&page=1&page_size=30`);
+  const tbody = document.getElementById('reportsBody');
+  if (!parsed.ok || !parsed.data || !Array.isArray(parsed.data.items)) {
+    tbody.innerHTML = '<tr><td colspan="6">Failed to load reports.</td></tr>';
+    return;
+  }
+  if (!parsed.data.items.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">No reports.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = parsed.data.items.map(r => {
+    const reportId = esc(r.report_id);
+    const isActive = activeReportId && activeReportId === r.report_id;
+    const statusText = String(r.status || 'unknown').toLowerCase();
+    return `
+      <tr class="${isActive ? 'report-row-active' : ''}" data-report-id="${reportId}">
+        <td><a href="#" data-open-report="${reportId}">${reportId}</a></td>
+        <td><span class="pill ${esc(statusText)}">${esc(statusText)}</span></td>
+        <td>${esc(r.verdict)}</td>
+        <td>${esc(r.risk_score)}</td>
+        <td>${esc(r.filename)}</td>
+        <td>
+          <div class="links">
+            <a href="#" data-open-report="${reportId}">select</a>
+            <a href="/api/reports/${encodeURIComponent(r.report_id)}/view" target="_blank">open</a>
+            <a href="/api/reports/${encodeURIComponent(r.report_id)}/evidence">evidence</a>
+            <a href="/api/reports/${encodeURIComponent(r.report_id)}/iocs/export?format=json">iocs json</a>
+            <a href="/api/reports/${encodeURIComponent(r.report_id)}/iocs/export?format=csv">iocs csv</a>
+          </div>
+        </td>
+      </tr>`;
+  }).join('');
+}
+
+async function refreshOps() {
+  const parsed = await getJson('/api/reports/ops/summary');
+  const box = document.getElementById('opsBox');
+  if (!parsed.ok || !parsed.data) {
+    box.textContent = 'Failed to load operations summary.';
+    return;
+  }
+  const queue = parsed.data.queue || {};
+  const vm = (parsed.data.vm_health || []).map(x => `${esc(x.name)}: ${x.healthy ? 'ready' : 'down'}${x.busy ? ' / busy' : ''}${x.reason ? ` / ${esc(x.reason)}` : ''}`).join('\n') || 'No VM data';
+  const failures = (parsed.data.top_failure_reasons || []).map(x => `${esc(x.reason)} (${esc(x.count)})`).join('\n') || 'None';
+  document.getElementById('metricQueued').textContent = String(queue.queued ?? 0);
+  document.getElementById('metricRunning').textContent = String(queue.running ?? 0);
+  document.getElementById('metricFinished').textContent = String(queue.done ?? 0);
+  document.getElementById('opsUpdatedAt').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  box.textContent = `Queue\n${JSON.stringify(queue, null, 2)}\n\nVMs\n${vm}\n\nTop failures\n${failures}`;
+}
+
+async function loadReport(reportId, keepPolling = true) {
+  const parsed = await getJson(`/api/reports/${encodeURIComponent(reportId)}`);
+  if (!parsed.ok || !parsed.data) {
+    setStatus('failed', reportId);
+    setResultBox(parsed.data || 'Failed to load report.');
+    return null;
+  }
+  activeReportId = reportId;
+  setStatus(parsed.data.status || 'running', reportId);
+  setResultBox(parsed.data);
+  await refreshReports();
+  if (keepPolling && !getTerminalStatus(parsed.data.status)) {
+    startReportPolling(reportId);
+  }
+  return parsed.data;
+}
+
+async function pollActiveReportLoop(reportId) {
+  if (isPollingReport) return;
+  isPollingReport = true;
+  try {
+    while (activeReportId === reportId) {
+      const parsed = await getJson(`/api/reports/${encodeURIComponent(reportId)}`);
+      if (!parsed.ok || !parsed.data) {
+        setStatus('failed', reportId);
+        setResultBox(parsed.data || 'Failed to load report.');
+        break;
+      }
+      const status = parsed.data.status || 'running';
+      setStatus(status, reportId);
+      setResultBox(parsed.data);
+      await refreshReports();
+      await refreshOps();
+      if (getTerminalStatus(status)) {
+        break;
+      }
+      await sleep(1500);
+    }
+  } finally {
+    isPollingReport = false;
+  }
+}
+
+function startReportPolling(reportId) {
+  activeReportId = reportId;
+  if (reportPollTimer) {
+    clearTimeout(reportPollTimer);
+    reportPollTimer = null;
+  }
+  pollActiveReportLoop(reportId);
+}
+
+function clearActiveSelection() {
+  activeReportId = null;
+  setStatus('idle', null);
+  setResultBox('No result yet.');
+  refreshReports();
+}
+
+function startDashboardRefresh() {
+  if (dashboardTimer) clearInterval(dashboardTimer);
+  dashboardTimer = setInterval(async () => {
+    await refreshOps();
+    await refreshReports();
+    if (!activeReportId) return;
+    const parsed = await getJson(`/api/reports/${encodeURIComponent(activeReportId)}`);
+    if (!parsed.ok || !parsed.data) return;
+    setStatus(parsed.data.status || 'running', activeReportId);
+    if (getTerminalStatus(parsed.data.status)) {
+      setResultBox(parsed.data);
+    }
+  }, 5000);
+}
+
+document.getElementById('uploadForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const fileInput = document.getElementById('fileInput');
+  if (!fileInput.files.length) return;
+  const form = new FormData();
+  form.append('file', fileInput.files[0]);
+  setStatus('uploading', null);
+  const parsed = await getJson('/api/samples/upload', { method: 'POST', body: form });
+  setResultBox(parsed.data);
+  if (parsed.ok && parsed.data && parsed.data.report_id) {
+    activeReportId = parsed.data.report_id;
+    setStatus(parsed.data.status || 'queued', activeReportId);
+    await refreshReports();
+    await refreshOps();
+    startReportPolling(parsed.data.report_id);
+  } else {
+    setStatus('failed', null);
+  }
+});
+
+document.getElementById('filterBtn').addEventListener('click', async () => {
+  await refreshReports();
+  await refreshOps();
+});
+
+document.getElementById('compareBtn').addEventListener('click', async () => {
+  const a = encodeURIComponent(document.getElementById('compareA').value || '');
+  const b = encodeURIComponent(document.getElementById('compareB').value || '');
+  if (!a || !b) return;
+  const parsed = await getJson(`/api/reports/compare?a=${a}&b=${b}`);
+  document.getElementById('compareBox').textContent = JSON.stringify(parsed.data, null, 2);
+});
+
+document.getElementById('clearSelectionBtn').addEventListener('click', clearActiveSelection);
+
+document.getElementById('reportsBody').addEventListener('click', async (event) => {
+  const trigger = event.target.closest('[data-open-report]');
+  if (!trigger) return;
+  event.preventDefault();
+  const reportId = trigger.getAttribute('data-open-report');
+  if (!reportId) return;
+  await loadReport(reportId, true);
+});
+
+refreshReports();
+refreshOps();
+startDashboardRefresh();
+</script>
+</body>
+</html>

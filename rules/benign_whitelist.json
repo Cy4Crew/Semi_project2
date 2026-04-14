@@ -1,0 +1,56 @@
+{
+  "path_contains": [
+    "__pycache__",
+    ".git/",
+    ".github/",
+    "node_modules/",
+    "venv/",
+    ".venv/",
+    "dist/",
+    "build/",
+    ".pytest_cache/"
+  ],
+  "file_names": [
+    "requirements.txt",
+    "package.json",
+    "package-lock.json",
+    "poetry.lock",
+    "pipfile",
+    "pipfile.lock",
+    "dockerfile",
+    "docker-compose.yml",
+    "readme.md",
+    ".gitignore",
+    ".dockerignore"
+  ],
+  "suffixes": [
+    ".md",
+    ".rst",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".ini",
+    ".lock",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".css",
+    ".scss",
+    ".map"
+  ],
+  "text_markers": [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "pytest",
+    "docker compose",
+    "nextjs",
+    "react",
+    "typescript",
+    "requirements.txt",
+    "package.json"
+  ]
+}

@@ -1,0 +1,31 @@
+services:
+  app:
+    build: .
+    ports:
+      - "${DOCKER_API_PORT:-8000}:${DOCKER_CONTAINER_API_PORT:-8000}"
+    volumes:
+      - ./samples:/app/samples
+      - ./artifacts:/app/artifacts
+      - ./rules:/app/rules
+    env_file:
+      - .env
+    environment:
+      API_HOST: ${DOCKER_API_HOST:-0.0.0.0}
+      API_PORT: ${DOCKER_CONTAINER_API_PORT:-8000}
+      SAMPLE_TIMEOUT_SECONDS: ${DOCKER_SAMPLE_TIMEOUT_SECONDS:-5}
+      SANDBOX_BACKEND: ${DOCKER_SANDBOX_BACKEND:-vmware-bridge}
+      SANDBOX_BRIDGE_URL: ${DOCKER_SANDBOX_BRIDGE_URL:-http://host.docker.internal:9080}
+      SANDBOX_VM_NAME: ${DOCKER_SANDBOX_VM_NAME:-win10x64}
+      SANDBOX_VM_SNAPSHOT: ${DOCKER_SANDBOX_VM_SNAPSHOT:-clean}
+      SANDBOX_JOB_TIMEOUT_SECONDS: ${DOCKER_SANDBOX_JOB_TIMEOUT_SECONDS:-180}
+      SANDBOX_DISABLE_NETWORK: ${DOCKER_SANDBOX_DISABLE_NETWORK:-true}
+      SANDBOX_REQUIRE_DYNAMIC_SUCCESS: ${DOCKER_SANDBOX_REQUIRE_DYNAMIC_SUCCESS:-true}
+      ENABLE_PCAP: ${DOCKER_ENABLE_PCAP:-false}
+      SURICATA_BINARY: ${DOCKER_SURICATA_BINARY:-}
+      SURICATA_RULES_PATH: ${DOCKER_SURICATA_RULES_PATH:-./rules/suricata.rules}
+      VOLATILITY3_BINARY: ${DOCKER_VOLATILITY3_BINARY:-}
+      MONITOR_LOGS_DIR: ${DOCKER_MONITOR_LOGS_DIR:-C:/analysis/monitor}
+      REPORT_DB_PATH: ${DOCKER_REPORT_DB_PATH:-./artifacts/reports.db}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
