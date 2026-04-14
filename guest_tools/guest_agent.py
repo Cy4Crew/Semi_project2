@@ -477,6 +477,9 @@ def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[d
             "skip_reason": "unsupported_extension",
             "fail_reason": "not_executable",
             "package": package,
+            "attempted": False,
+            "succeeded": False,
+            "failed": False,
         }
 
     append_timeline(timeline, "member_start", member=str(path), command=command, package=package)
@@ -526,6 +529,9 @@ def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[d
             "behavior": behavior,
             "skipped": False,
             "package": package,
+            "attempted": True,
+            "succeeded": True,
+            "failed": False,
         }
 
     except subprocess.TimeoutExpired as exc:
@@ -554,6 +560,9 @@ def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[d
             "skipped": False,
             "fail_reason": "timeout",
             "package": package,
+            "attempted": True,
+            "succeeded": False,
+            "failed": True,
         }
 
     except Exception as exc:
@@ -566,6 +575,9 @@ def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[d
             "strategy": "guest_native",
             "fail_reason": "execution_failed",
             "package": package,
+            "attempted": True,
+            "succeeded": False,
+            "failed": True,
         }
 
 
