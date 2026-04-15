@@ -17,6 +17,27 @@ from app.utils.metrics_store import recent_events, stage_summary, top_failure_re
 from app.services.rules_service import build_rule_manifest
 from app.services.report_service import create_reanalysis_job
 
+
+
+def _is_artifact_noise_path(path: str) -> bool:
+    lower = str(path or '').replace('/', '\\').lower()
+    name = lower.rsplit('\\', 1)[-1]
+    return name.endswith('_stdout.txt') or name.endswith('_stderr.txt') or name in {'stdout.txt', 'stderr.txt'}
+
+
+def _is_extract_original_path(path: str) -> bool:
+    lower = str(path or '').replace('/', '\\').lower()
+    return lower.startswith('extract\\')
+
+
+def _display_drop_rows(rows: list[dict]) -> list[dict]:
+    out = []
+    for row in rows:
+        path = str(row.get('path') or '')
+        if _is_artifact_noise_path(path) or _is_extract_original_path(path):
+            continue
+        out.append(row)
+    return out
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 _ops_scheduler = MultiVMScheduler()
 
@@ -275,7 +296,8 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     exec_count = int(dynamic_result.get("archive_member_exec_count", 0) or 0)
     skipped_count = int(dynamic_result.get("archive_member_skipped_count", 0) or 0)
     network_endpoints = _as_list(_as_dict(dynamic_result.get("network_trace")).get("endpoints"))
-    dropped_files = _as_list(evidence_bundle.get("dropped_files") or _as_dict(dynamic_result.get("filesystem_delta")).get("created_details"))
+    dropped_files_raw = _as_list(evidence_bundle.get("dropped_files") or _as_dict(dynamic_result.get("filesystem_delta")).get("created_details"))
+    dropped_files = _display_drop_rows(dropped_files_raw)
     process_tree = _as_list(evidence_bundle.get("process_tree") or _as_dict(dynamic_result.get("process_delta")).get("new_process_tree"))
     memory_dumps = _as_list(evidence_bundle.get("memory_dumps") or dynamic_result.get("memory_dumps"))
     timeline = _as_list(dynamic_result.get("timeline"))
@@ -315,17 +337,22 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
         tags = ", ".join(str(x) for x in entry.get("malware_type_tags", [])[:4]) or "-"
         yara = ", ".join(str(x) for x in entry.get("yara_matches", [])[:3] if not str(x).startswith("yara_error:")) or "-"
         evidence = "; ".join(str(x) for x in entry.get("top_evidence", [])[:2]) or "-"
-        executed = "yes" if entry.get("executed") else "no"
+        attempted = bool(entry.get("member_runtime", {}).get("attempted"))
+        succeeded = bool(entry.get("member_runtime", {}).get("succeeded")) or bool(entry.get("executed"))
+        failed = bool(entry.get("member_runtime", {}).get("failed"))
+        executed = "success" if succeeded else ("failed" if failed else "no")
+        attempt = "yes" if attempted else "no"
         top_file_rows += (
             f"<tr><td class='file-col'>{_e(entry.get('file', '-'))}</td>"
             f"<td>{file_score}</td>"
             f"<td><span class='sev {sev}'>{_e(file_verdict)}</span></td>"
             f"<td>{_e(executed)}</td>"
+            f"<td>{_e(attempt)}</td>"
             f"<td>{_e(tags)}</td>"
             f"<td>{_e(yara)}</td>"
             f"<td>{_e(evidence)}</td></tr>"
         )
-    top_file_rows = top_file_rows or "<tr><td colspan='7' class='muted'>No files analyzed.</td></tr>"
+    top_file_rows = top_file_rows or "<tr><td colspan='8' class='muted'>No files analyzed.</td></tr>"
 
     evidence_link_map = {str(x.get("signal") or ""): _as_list(x.get("links")) for x in _as_list(artifact_manifest.get("evidence_links"))}
     evidence_sorted = sorted(evidence_list, key=lambda x: int(x.get("weight", 0) or 0), reverse=True)[:12]
@@ -373,6 +400,8 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     network_rows = "".join(
         f"<tr><td>{_e(x.get('pid', '-'))}</td><td>{_e(x.get('remote_ip', '-'))}</td><td>{_e(x.get('remote_port', '-'))}</td><td>{_e(x.get('status', '-'))}</td></tr>" for x in network_endpoints[:20]
     ) or "<tr><td colspan='4' class='muted'>No network endpoints recorded.</td></tr>"
+    if any(int(x.get('pid', 0) or 0) == 0 for x in network_endpoints):
+        network_rows += "<tr><td colspan='4' class='muted'>Note: PID 0 or unowned connections are weak signals and may reflect background VM traffic.</td></tr>"
     timeline_rows = "".join(
         f"<tr><td>{_e(x.get('ts', '-'))}</td><td>{_e(x.get('stage', '-'))}</td><td>{_e(json.dumps({k: v for k, v in x.items() if k not in {'ts', 'stage'}}, ensure_ascii=False))}</td></tr>" for x in timeline[:20]
     ) or "<tr><td colspan='3' class='muted'>No timeline events recorded.</td></tr>"
@@ -440,6 +469,7 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
           <div class='metric'><span>Failed exec</span><strong>{failed_count}</strong></div>
           <div class='metric'><span>Network endpoints</span><strong>{len(network_endpoints)}</strong></div>
           <div class='metric'><span>Dropped files</span><strong>{len(dropped_files)}</strong></div>
+          <div class='metric'><span>Attempted exec</span><strong>{_e(dynamic_result.get('archive_member_attempted_count', 0))}</strong></div>
           <div class='metric'><span>Processes</span><strong>{len(process_tree)}</strong></div>
           <div class='metric'><span>Family confidence</span><strong>{_e(family_confidence.upper())}</strong></div>
         </div>
@@ -469,7 +499,7 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     <section class='grid'>
       <div class='card'>
         <h2>Behavior summary</h2>
-        <table><thead><tr><th>File</th><th>Score</th><th>Severity</th><th>Executed</th><th>Type tags</th><th>YARA</th><th>Top evidence</th></tr></thead><tbody>{top_file_rows}</tbody></table>
+        <table><thead><tr><th>File</th><th>Score</th><th>Severity</th><th>Exec</th><th>Attempt</th><th>Type tags</th><th>YARA</th><th>Top evidence</th></tr></thead><tbody>{top_file_rows}</tbody></table>
       </div>
       <div class='card'>
         <h2>IOC summary</h2>

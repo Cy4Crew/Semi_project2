@@ -423,6 +423,43 @@ def build_command(path: Path) -> tuple[list[str] | None, str]:
     return None, package
 
 
+
+
+def _sample_process_state(root_pid: int, path: Path) -> tuple[list[dict], list[dict]]:
+    tree: list[dict] = []
+    netrows: list[dict] = []
+    if root_pid <= 0:
+        return tree, netrows
+    try:
+        root = psutil.Process(root_pid)
+        procs = [root] + root.children(recursive=True)
+    except Exception:
+        procs = []
+    seen = set()
+    for proc in procs:
+        try:
+            if proc.pid in seen:
+                continue
+            seen.add(proc.pid)
+            cmdline = ' '.join(proc.cmdline())[:300]
+            tree.append({'pid': proc.pid, 'ppid': proc.ppid(), 'name': proc.name(), 'cmdline': cmdline})
+            for conn in proc.net_connections(kind='inet'):
+                raddr = getattr(conn, 'raddr', None)
+                if not raddr:
+                    continue
+                remote_ip = getattr(raddr, 'ip', None) or (raddr[0] if isinstance(raddr, tuple) and len(raddr) > 0 else None)
+                remote_port = getattr(raddr, 'port', None) or (raddr[1] if isinstance(raddr, tuple) and len(raddr) > 1 else None)
+                if remote_ip:
+                    netrows.append({'pid': proc.pid, 'remote_ip': str(remote_ip), 'remote_port': int(remote_port or 0), 'status': str(conn.status)})
+        except Exception:
+            continue
+    return tree[:40], netrows[:40]
+
+
+def _is_noise_created_path(path_str: str) -> bool:
+    lower = str(path_str or '').replace('/', '\\').lower()
+    name = lower.rsplit('\\', 1)[-1]
+    return name.endswith('_stdout.txt') or name.endswith('_stderr.txt') or name in {'stdout.txt', 'stderr.txt'}
 def classify_created_file(path_str: str) -> str:
     suffix = Path(path_str).suffix.lower()
     lowered = path_str.lower()
@@ -484,87 +521,47 @@ def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[d
 
     append_timeline(timeline, "member_start", member=str(path), command=command, package=package)
     started = time.time()
+    proc = None
+    stdout = ""
+    stderr = ""
+    timed_out = False
+    process_tree_live: list[dict] = []
+    network_endpoints_live: list[dict] = []
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout_seconds,
             cwd=str(path.parent),
             creationflags=CREATE_NO_WINDOW,
         )
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        (out_dir / f"{path.stem}_stdout.txt").write_text(stdout, encoding="utf-8", errors="ignore")
-        (out_dir / f"{path.stem}_stderr.txt").write_text(stderr, encoding="utf-8", errors="ignore")
-
-        append_timeline(
-            timeline,
-            "member_end",
-            member=str(path),
-            returncode=proc.returncode,
-            duration_ms=int((time.time() - started) * 1000),
-        )
-
-        text_l = (stdout + "\n" + stderr + "\n" + " ".join(command)).lower()
-        behavior = {
-            "network_signal": any(m in text_l for m in ["http://", "https://", "ftp://", "downloadstring", "invoke-webrequest", "urlmon", "bitsadmin", "certutil -urlcache"]),
-            "persistence_signal": any(m in text_l for m in ["currentversion\\run", "runonce", "schtasks", "startup", "reg add"]),
-            "ransomware_signal": any(m in text_l for m in ["vssadmin", "wbadmin", "bcdedit", "ransom", "decrypt"]),
-            "execution_signal": any(m in text_l for m in ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript"]),
-        }
-
-        return {
-            "name": path.name,
-            "path": rel_path,
-            "command": command,
-            "returncode": proc.returncode,
-            "timed_out": False,
-            "stdout_preview": stdout[:1200],
-            "stderr_preview": stderr[:1200],
-            "strategy": "guest_native",
-            "behavior": behavior,
-            "skipped": False,
-            "package": package,
-            "attempted": True,
-            "succeeded": True,
-            "failed": False,
-        }
-
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        append_timeline(timeline, "member_timeout", member=str(path), duration_ms=int((time.time() - started) * 1000))
-
-        text_l = (stdout + "\n" + stderr + "\n" + " ".join(command)).lower()
-        behavior = {
-            "network_signal": any(m in text_l for m in ["http://", "https://", "ftp://", "downloadstring", "invoke-webrequest", "urlmon", "bitsadmin", "certutil -urlcache"]),
-            "persistence_signal": any(m in text_l for m in ["currentversion\\run", "runonce", "schtasks", "startup", "reg add"]),
-            "ransomware_signal": any(m in text_l for m in ["vssadmin", "wbadmin", "bcdedit", "ransom", "decrypt"]),
-            "execution_signal": any(m in text_l for m in ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript"]),
-        }
-
-        return {
-            "name": path.name,
-            "path": rel_path,
-            "command": command,
-            "returncode": -1,
-            "timed_out": True,
-            "stdout_preview": stdout[:1200],
-            "stderr_preview": stderr[:1200],
-            "strategy": "guest_native",
-            "behavior": behavior,
-            "skipped": False,
-            "fail_reason": "timeout",
-            "package": package,
-            "attempted": True,
-            "succeeded": False,
-            "failed": True,
-        }
-
+        deadline = time.time() + timeout_seconds
+        while True:
+            process_tree_live, network_endpoints_live = _sample_process_state(proc.pid, path)
+            if proc.poll() is not None:
+                break
+            if time.time() >= deadline:
+                timed_out = True
+                _terminate_process_tree(proc.pid)
+                break
+            time.sleep(0.5)
+        out, err = proc.communicate(timeout=5)
+        stdout = out or ""
+        stderr = err or ""
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if proc is not None:
+            _terminate_process_tree(proc.pid)
+            try:
+                out, err = proc.communicate(timeout=5)
+                stdout = out or ""
+                stderr = err or ""
+            except Exception:
+                pass
     except Exception as exc:
         append_timeline(timeline, "member_error", member=str(path), error=str(exc))
         return {
@@ -578,9 +575,49 @@ def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[d
             "attempted": True,
             "succeeded": False,
             "failed": True,
+            "process_tree_live": process_tree_live,
+            "network_endpoints_live": network_endpoints_live,
         }
 
+    runtime_ms = int((time.time() - started) * 1000)
+    (out_dir / f"{path.stem}_stdout.txt").write_text(stdout, encoding="utf-8", errors="ignore")
+    (out_dir / f"{path.stem}_stderr.txt").write_text(stderr, encoding="utf-8", errors="ignore")
 
+    rc = -1 if timed_out else int(proc.returncode if proc and proc.returncode is not None else -1)
+    append_timeline(timeline, "member_end" if not timed_out else "member_timeout", member=str(path), returncode=rc, duration_ms=runtime_ms)
+
+    text_l = (stdout + "\n" + stderr + "\n" + " ".join(command)).lower()
+    launch_error = _detect_launch_error(stdout, stderr, command)
+    behavior = {
+        "network_signal": bool(network_endpoints_live) or any(m in text_l for m in ["http://", "https://", "ftp://", "downloadstring", "invoke-webrequest", "urlmon", "bitsadmin", "certutil -urlcache"]),
+        "persistence_signal": any(m in text_l for m in ["currentversion\\run", "runonce", "schtasks", "startup", "reg add"]),
+        "ransomware_signal": any(m in text_l for m in ["vssadmin", "wbadmin", "bcdedit", "ransom", "decrypt"]),
+        "execution_signal": bool(process_tree_live) or (path.suffix.lower() in {".exe", ".ps1", ".bat", ".cmd", ".js", ".vbs"} and runtime_ms >= 1000),
+    }
+    succeeded, fail_reason = _classify_execution_outcome(path, command, rc, timed_out, runtime_ms, stdout, stderr)
+    if launch_error and not fail_reason:
+        fail_reason = f"launch_error:{launch_error}"
+
+    return {
+        "name": path.name,
+        "path": rel_path,
+        "command": command,
+        "returncode": rc,
+        "timed_out": timed_out,
+        "stdout_preview": stdout[:1200],
+        "stderr_preview": stderr[:1200],
+        "strategy": "guest_native",
+        "behavior": behavior,
+        "skipped": False,
+        "package": package,
+        "attempted": True,
+        "succeeded": bool(succeeded),
+        "failed": not bool(succeeded),
+        "fail_reason": fail_reason,
+        "runtime_ms": runtime_ms,
+        "process_tree_live": process_tree_live,
+        "network_endpoints_live": network_endpoints_live,
+    }
 
 
 def maybe_capture_memory_dump(proc_items: list[dict], outbox: Path, timeline: list[dict]) -> list[dict]:
@@ -814,11 +851,30 @@ def analyze_job(job_dir: Path) -> dict:
     after_services = collect_services_snapshot()
 
     created = sorted(after_files - before_files)
-    created_details = [{"path": p, "category": classify_created_file(p)} for p in created[:200]]
-    dropped_exec_candidates = [c for c in created_details if Path(c["path"]).suffix.lower() in EXEC_SUFFIXES]
+    created_details = [{"path": p, "category": classify_created_file(p)} for p in created[:200] if not _is_noise_created_path(p)]
+    dropped_exec_candidates = [c for c in created_details if Path(c["path"]).suffix.lower() in EXEC_SUFFIXES and not str(c["path"]).lower().startswith("extract\\")]
 
     process_delta = summarize_process_delta(before_proc, after_proc)
+    live_processes = []
+    live_endpoints = []
+    for member in member_results:
+        live_processes.extend(member.get("process_tree_live") or [])
+        live_endpoints.extend(member.get("network_endpoints_live") or [])
+    if live_processes:
+        existing = {(x.get("pid"), x.get("name"), x.get("cmdline")) for x in process_delta.get("new_process_tree", [])}
+        for row in live_processes:
+            key = (row.get("pid"), row.get("name"), row.get("cmdline"))
+            if key not in existing:
+                process_delta.setdefault("new_process_tree", []).append(row)
+        process_delta["suspicious_processes"] = [x for x in process_delta.get("new_process_tree", []) if any(marker in (((x.get("name") or "") + " " + (x.get("cmdline") or "")).lower()) for marker in SUSPICIOUS_PROCESS_MARKERS)][:20]
     network_trace = summarize_network_delta(before_net, after_net)
+    if live_endpoints:
+        existing = {(x.get("pid"), x.get("remote_ip"), x.get("remote_port"), x.get("status")) for x in network_trace.get("endpoints", [])}
+        for row in live_endpoints:
+            key = (row.get("pid"), row.get("remote_ip"), row.get("remote_port"), row.get("status"))
+            if key not in existing:
+                network_trace.setdefault("endpoints", []).append(row)
+        network_trace["connection_count"] = len(network_trace.get("endpoints", []))
     memory_dumps = maybe_capture_memory_dump(process_delta.get("suspicious_processes", []), outbox, timeline)
     external_monitor = collect_external_monitor_logs(outbox, timeline)
 
@@ -834,7 +890,8 @@ def analyze_job(job_dir: Path) -> dict:
     combined_l = combined.lower()
     created_lower = "\n".join(c["path"].lower() for c in created_details)
 
-    exec_signal = bool(process_delta["suspicious_processes"]) or any(k in combined_l for k in ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript"])
+    successful_members = [m for m in member_results if m.get("succeeded")]
+    exec_signal = bool(successful_members) or bool(process_delta["suspicious_processes"]) or any(k in combined_l for k in ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript"])
     persistence_signal = (
         any(k in combined_l for k in [r"currentversion\run", "runonce", "schtasks", "startup"])
         or any("startup_drop" == c["category"] for c in created_details)
@@ -843,14 +900,18 @@ def analyze_job(job_dir: Path) -> dict:
         or bool(registry_diff.get("added"))
         or "scheduledtasks" in created_lower
     )
-    file_signal = bool(created_details)
-    network_signal = bool(network_trace["endpoints"]) or any(k in combined_l for k in ["http://", "https://", "ftp://"])
+    file_signal = bool([c for c in created_details if c.get("category") not in {"other_drop"}])
+    network_signal = bool([x for x in network_trace["endpoints"] if int(x.get("pid", 0) or 0) > 0]) or any(k in combined_l for k in ["http://", "https://", "ftp://"])
     ransomware_signal = any(k in combined_l for k in ["vssadmin", "wbadmin", "bcdedit", "ransom", "decrypt"])
     note_signal = any(Path(c["path"]).suffix.lower() == ".txt" and ("readme" in c["path"].lower() or "decrypt" in c["path"].lower()) for c in created_details)
 
     score = 0
     if exec_signal:
         score += 20
+    if any(Path(str(m.get("path") or "")).suffix.lower() == ".exe" and m.get("succeeded") for m in member_results):
+        score += 10
+    if any(int(m.get("runtime_ms", 0) or 0) >= 10000 for m in successful_members):
+        score += 8
     if persistence_signal:
         score += 25
     if file_signal:
