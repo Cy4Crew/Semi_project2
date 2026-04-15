@@ -23,6 +23,75 @@ INJECTION_MARKERS = {"createremotethread", "writeprocessmemory", "virtualalloc",
 
 MALWARE_TYPE_PRIORITY = ["ransomware", "infostealer", "rat", "backdoor", "dropper", "downloader", "loader", "trojan", "persistence", "script"]
 
+ARTIFACT_BASENAMES = {"stdout.txt", "stderr.txt"}
+DOCUMENT_PACKAGES = {"office_macro", "office_document", "pdf", "shortcut"}
+
+def _is_artifact_output_path(path: str) -> bool:
+    lowered = str(path or "").replace("/", "\\").lower()
+    name = Path(lowered).name
+    if name.endswith("_stdout.txt") or name.endswith("_stderr.txt"):
+        return True
+    if "\\artifacts\\" in lowered and name.endswith(".txt"):
+        return True
+    return False
+
+
+def _interesting_created_details(dynamic_result: dict[str, Any]) -> list[dict[str, Any]]:
+    items = []
+    for entry in ((dynamic_result.get("filesystem_delta") or {}).get("created_details") or []):
+        path = str(entry.get("path") or "")
+        if _is_artifact_output_path(path):
+            continue
+        items.append(entry)
+    return items
+
+
+def _network_signal_strength(dynamic_result: dict[str, Any]) -> tuple[int, list[dict[str, Any]]]:
+    endpoints = []
+    for row in ((dynamic_result.get("network_trace") or {}).get("endpoints") or []):
+        try:
+            pid = int(row.get("pid") or 0)
+        except Exception:
+            pid = 0
+        ip = str(row.get("remote_ip") or "")
+        if not ip:
+            continue
+        if pid > 0:
+            endpoints.append(dict(row))
+    if endpoints:
+        return 2, endpoints
+    fallback = []
+    for row in ((dynamic_result.get("network_trace") or {}).get("endpoints") or []):
+        ip = str(row.get("remote_ip") or "")
+        if ip:
+            fallback.append(dict(row))
+    return (1 if fallback else 0), fallback
+
+
+def _member_runtime_ms(dynamic_result: dict[str, Any], path: str) -> int:
+    wanted = normalize_member_path(path)
+    current_member = None
+    started = None
+    duration = 0
+    for event in dynamic_result.get("timeline", []) or []:
+        if event.get("event") == "member_start":
+            current_member = normalize_member_path(str(event.get("member") or ""))
+            started = event.get("ts")
+        elif event.get("event") == "member_end":
+            member = normalize_member_path(str(event.get("member") or ""))
+            if member == wanted:
+                try:
+                    duration = int(event.get("duration_ms") or 0)
+                except Exception:
+                    duration = 0
+                break
+    return duration
+
+
+def _contains_test_indicator(item: dict[str, Any]) -> bool:
+    text = _text_blob(item.get("file"), item.get("summary_reasons"), item.get("tags"), item.get("iocs"), item.get("base64_decoded_snippets"))
+    return any(marker in text for marker in ["example.invalid", "benign test", "safe_malware_test_samples"])
+
 
 def _ordered_unique(values: list[str]) -> list[str]:
     seen = set()
@@ -103,64 +172,70 @@ def _member_behavior(member_result: dict | None, path: str = "archive") -> dict[
             "reasons": [],
             "evidence_items": [],
         }
-    text = _text_blob(member_result.get("command"), member_result.get("stdout_preview"), member_result.get("stderr_preview"))
+    text = _text_blob(member_result.get("stdout_preview"), member_result.get("stderr_preview"))
+    command_text = _text_blob(member_result.get("command"))
+    package = str(member_result.get("package") or "")
     network_hits = _count_present(NETWORK_MARKERS, text)
     persistence_hits = _count_present(PERSISTENCE_MARKERS, text)
     ransomware_hits = _count_present(RANSOMWARE_MARKERS, text)
     injection_hits = _count_present(INJECTION_MARKERS, text)
     exec_hits = _count_present(HIGH_RISK_PROCESS_MARKERS, text)
+    if package not in DOCUMENT_PACKAGES:
+        exec_hits = max(exec_hits, _count_present(HIGH_RISK_PROCESS_MARKERS, command_text))
     score = 0
     reasons: list[str] = []
     evidence_items: list[dict[str, Any]] = []
-    executed = not bool(member_result.get("skipped"))
+    executed = bool(member_result.get("succeeded"))
+    returncode = member_result.get("returncode")
+    timed_out = bool(member_result.get("timed_out"))
     if executed:
-        score += 10
+        base_pts = 6 if package in DOCUMENT_PACKAGES else 10
+        score += base_pts
         reasons.append("executed in sandbox")
-        evidence_items.append(_evidence_entry("dynamic", "sandbox_execution", 10, path, "archive member executed inside sandbox", "medium"))
-    if exec_hits:
-        pts = min(18, 6 + exec_hits * 2)
+        evidence_items.append(_evidence_entry("dynamic", "sandbox_execution", base_pts, path, "archive member executed inside sandbox", "medium"))
+    if exec_hits and package not in DOCUMENT_PACKAGES:
+        pts = min(14, 4 + exec_hits * 2)
         score += pts
         reasons.append("suspicious runtime command or process marker")
         evidence_items.append(_evidence_entry("dynamic", "suspicious_runtime_process", pts, path, f"high-risk runtime markers observed ({exec_hits})", "high"))
     if network_hits:
-        pts = min(20, 8 + network_hits * 2)
+        pts = min(18, 6 + network_hits * 2)
         score += pts
         reasons.append("runtime download or remote communication marker")
         evidence_items.append(_evidence_entry("dynamic", "network_or_download", pts, path, f"remote communication or download marker count={network_hits}", "high"))
     if persistence_hits:
-        pts = min(22, 10 + persistence_hits * 2)
+        pts = min(20, 8 + persistence_hits * 2)
         score += pts
         reasons.append("runtime persistence marker")
         evidence_items.append(_evidence_entry("dynamic", "persistence", pts, path, f"autorun/service/task marker count={persistence_hits}", "critical"))
     if ransomware_hits:
-        pts = min(28, 14 + ransomware_hits * 3)
+        pts = min(24, 12 + ransomware_hits * 3)
         score += pts
         reasons.append("runtime ransomware marker")
         evidence_items.append(_evidence_entry("dynamic", "ransomware_behavior", pts, path, f"destructive or ransom-related marker count={ransomware_hits}", "critical"))
     if injection_hits:
-        pts = min(22, 10 + injection_hits * 2)
+        pts = min(20, 8 + injection_hits * 2)
         score += pts
         reasons.append("runtime injection or memory tampering marker")
         evidence_items.append(_evidence_entry("dynamic", "process_injection", pts, path, f"injection marker count={injection_hits}", "critical"))
-    if bool(member_result.get("timed_out")):
+    if timed_out:
         score += 4
         reasons.append("sandbox execution timed out")
         evidence_items.append(_evidence_entry("dynamic", "timeout", 4, path, "sandbox run hit timeout", "medium"))
-    rc = member_result.get("returncode")
-    if rc not in (None, 0, "0") and not bool(member_result.get("timed_out")):
+    if returncode not in (None, 0, "0") and not timed_out:
         score += 3
         reasons.append("non-zero exit during execution")
-        evidence_items.append(_evidence_entry("dynamic", "nonzero_exit", 3, path, f"process exited with return code {rc}", "medium"))
+        evidence_items.append(_evidence_entry("dynamic", "nonzero_exit", 3, path, f"process exited with return code {returncode}", "medium"))
     return {
         "executed": executed,
         "network_signal": network_hits > 0,
         "persistence_signal": persistence_hits > 0,
         "ransomware_signal": ransomware_hits > 0,
-        "execution_signal": exec_hits > 0,
+        "execution_signal": exec_hits > 0 and package not in DOCUMENT_PACKAGES,
         "injection_signal": injection_hits > 0,
-        "timed_out": bool(member_result.get("timed_out")),
-        "nonzero_exit": rc not in (None, 0, "0"),
-        "score": min(score, 65),
+        "timed_out": timed_out,
+        "nonzero_exit": returncode not in (None, 0, "0"),
+        "score": min(score, 55),
         "reasons": reasons,
         "evidence_items": evidence_items,
     }
@@ -315,7 +390,8 @@ def _archive_profile(scored_or_static_files: list[dict[str, Any]], dynamic_resul
         if item.get("final_score", 0) >= 40:
             medium_or_higher += 1
     executed = int(dynamic_result.get("archive_member_exec_count", 0) or 0)
-    runtime_signal = any(bool(dynamic_result.get(k)) for k in ["network_signal", "persistence_signal", "ransomware_signal", "exec_signal"])
+    network_strength, _ = _network_signal_strength(dynamic_result)
+    runtime_signal = bool(network_strength) or any(bool(dynamic_result.get(k)) for k in ["persistence_signal", "ransomware_signal", "exec_signal"])
     developer_heavy = (
         file_count >= 4
         and (dev_count / file_count) >= 0.35
@@ -369,6 +445,8 @@ def calculate_file_assessment(static_item: dict, dynamic_result: dict) -> dict[s
     member = member_result_map(dynamic_result).get(path)
     behavior = _member_behavior(member, path)
     benign_info = evaluate_benign_indicators(item)
+    runtime_ms = _member_runtime_ms(dynamic_result, path)
+    test_indicator = _contains_test_indicator(item)
 
     reasons: list[str] = []
     evidence_items: list[dict[str, Any]] = []
@@ -388,24 +466,24 @@ def calculate_file_assessment(static_item: dict, dynamic_result: dict) -> dict[s
     elif suffix in SCRIPT_SUFFIXES:
         breakdown["extension"] += 2
     elif suffix in {".docm", ".xlsm"}:
-        breakdown["extension"] += 2
+        breakdown["extension"] += 1
 
     if len(yara_hits) >= 2:
-        breakdown["yara"] += 18
+        breakdown["yara"] += 14
         reasons.append(f"YARA matches: {len(yara_hits)}")
         evidence_items.append(_evidence_entry("static", "multiple_yara_hits", 18, path, f"matched {len(yara_hits)} YARA rules", "high"))
     elif len(yara_hits) == 1:
-        breakdown["yara"] += 12
+        breakdown["yara"] += 10
         reasons.append("single YARA match")
         evidence_items.append(_evidence_entry("static", "single_yara_hit", 12, path, f"matched YARA rule {yara_hits[0]}", "high"))
 
     high_families = families & {"ransomware", "infostealer", "dropper", "rat", "downloader"}
     if "ransomware" in high_families:
-        breakdown["family"] += 14
+        breakdown["family"] += 16
         reasons.append("ransomware family indicator")
         evidence_items.append(_evidence_entry("static", "family_ransomware", 14, path, "static family hint points to ransomware", "critical"))
     elif high_families:
-        breakdown["family"] += 10
+        breakdown["family"] += 12
         reasons.append("malware family indicator")
         evidence_items.append(_evidence_entry("static", "family_hint", 10, path, f"family hint(s): {', '.join(sorted(high_families))}", "high"))
 
@@ -432,11 +510,11 @@ def calculate_file_assessment(static_item: dict, dynamic_result: dict) -> dict[s
         breakdown["ioc"] += 2
 
     if "script_obfuscation" in tags or "packed_or_obfuscated" in tags:
-        breakdown["obfuscation"] += 8
+        breakdown["obfuscation"] += 6
         reasons.append("obfuscation marker")
         evidence_items.append(_evidence_entry("static", "obfuscation", 8, path, "strong obfuscation or packing marker", "medium"))
     elif "light_obfuscation" in tags or entropy >= float(settings.entropy_threshold):
-        breakdown["obfuscation"] += 4
+        breakdown["obfuscation"] += 3
         reasons.append("packed-like or elevated entropy")
         evidence_items.append(_evidence_entry("static", "elevated_entropy", 4, path, "entropy above threshold or light obfuscation", "low"))
 
@@ -449,10 +527,10 @@ def calculate_file_assessment(static_item: dict, dynamic_result: dict) -> dict[s
         keyword_hits += 1
         keyword_details.append("medium risk static marker")
     if keyword_hits >= 2:
-        breakdown["keywords"] += 6
+        breakdown["keywords"] += 4
         evidence_items.append(_evidence_entry("static", "keyword_cluster", 6, path, "; ".join(keyword_details), "medium"))
     elif keyword_hits == 1:
-        breakdown["keywords"] += 3
+        breakdown["keywords"] += 2
 
     static_score = sum(v for k, v in breakdown.items() if k != "dynamic")
     raw_score = min(100, static_score + breakdown["dynamic"])
@@ -471,6 +549,26 @@ def calculate_file_assessment(static_item: dict, dynamic_result: dict) -> dict[s
         raw_score = max(raw_score, 28)
     if "script_like_txt" in tags and breakdown["dynamic"] == 0:
         raw_score = max(raw_score, 35)
+
+    if member and member.get("succeeded") and suffix == ".exe":
+        raw_score += 8
+        reasons.append("successful PE execution")
+        evidence_items.append(_evidence_entry("dynamic", "successful_pe_execution", 8, path, "portable executable completed in sandbox", "high"))
+        if runtime_ms >= 10000:
+            raw_score += 8
+            reasons.append("sustained runtime observed")
+            evidence_items.append(_evidence_entry("dynamic", "sustained_runtime", 8, path, f"runtime {runtime_ms} ms", "high"))
+        if runtime_ms >= 30000:
+            raw_score += 4
+            evidence_items.append(_evidence_entry("dynamic", "long_runtime", 4, path, f"extended runtime {runtime_ms} ms", "medium"))
+    if member and member.get("succeeded") and suffix in SCRIPT_SUFFIXES:
+        raw_score += 4
+    if suffix == ".exe" and member and member.get("succeeded") and (high_families or suspicious_imports or "packed_or_obfuscated" in tags):
+        raw_score = max(raw_score, 45)
+    if test_indicator and breakdown["dynamic"] == 0:
+        raw_score = min(raw_score, 22)
+    elif test_indicator and breakdown["dynamic"] > 0:
+        raw_score = max(0, raw_score - 8)
 
     benign_hits = benign_info.get("benign_hits") or []
     if benign_info.get("is_likely_benign") and breakdown["dynamic"] == 0 and not high_families and not yara_hits:
@@ -544,8 +642,11 @@ def _top_reasons(files: list[dict], dynamic_result: dict) -> list[str]:
         weight = 4 if item.get("final_verdict") == "malicious" else 2 if item.get("final_verdict") == "suspicious" else 1
         for reason in item.get("summary_reasons", [])[:6]:
             counter[str(reason)] += weight
-    if dynamic_result.get("network_signal"):
+    network_strength, _ = _network_signal_strength(dynamic_result)
+    if network_strength == 2:
         counter["archive-level network activity observed"] += 4
+    elif network_strength == 1:
+        counter["weak archive-level network activity observed"] += 1
     if dynamic_result.get("persistence_signal"):
         counter["archive-level persistence activity observed"] += 4
     if dynamic_result.get("ransomware_signal"):
@@ -563,8 +664,11 @@ def _aggregate_evidence_list(files: list[dict], dynamic_result: dict, archive_pr
         evidence_items.append(_evidence_entry("dynamic", "archive_ransomware_signal", 18, "archive", "archive-level ransomware behavior observed", "critical"))
     if dynamic_result.get("persistence_signal"):
         evidence_items.append(_evidence_entry("dynamic", "archive_persistence_signal", 14, "archive", "archive-level persistence behavior observed", "critical"))
-    if dynamic_result.get("network_signal"):
-        evidence_items.append(_evidence_entry("dynamic", "archive_network_signal", 10, "archive", "archive-level network communication observed", "high"))
+    network_strength, linked_endpoints = _network_signal_strength(dynamic_result)
+    if network_strength == 2:
+        evidence_items.append(_evidence_entry("dynamic", "archive_network_signal", 10, "archive", f"archive-level network communication observed ({len(linked_endpoints)} linked endpoint(s))", "high"))
+    elif network_strength == 1:
+        evidence_items.append(_evidence_entry("dynamic", "weak_archive_network_signal", 4, "archive", "unlinked network activity observed during sandbox run", "low"))
     evidence_items.extend(archive_profile.get("evidence_items", []))
     evidence_items = sorted(evidence_items, key=lambda e: abs(int(e.get("weight") or 0)), reverse=True)
     deduped: list[dict[str, Any]] = []
@@ -609,14 +713,21 @@ def calculate_score(scored_files: list[dict], dynamic_result: dict) -> dict[str,
     review_count = sum(1 for item in scored_files if (item.get("final_verdict") or _severity_from_score(int(item.get("final_score") or item.get("score") or 0))) == "review")
 
     dynamic_bonus = 0
-    if dynamic_result.get("network_signal"):
+    network_strength, linked_endpoints = _network_signal_strength(dynamic_result)
+    if network_strength == 2:
         dynamic_bonus += 10
+    elif network_strength == 1:
+        dynamic_bonus += 3
     if dynamic_result.get("persistence_signal"):
         dynamic_bonus += 14
     if dynamic_result.get("ransomware_signal"):
         dynamic_bonus += 18
     if dynamic_result.get("exec_signal"):
         dynamic_bonus += 5
+    if int(dynamic_result.get("archive_member_exec_count", 0) or 0) > 0:
+        dynamic_bonus += 6
+    if _interesting_created_details(dynamic_result):
+        dynamic_bonus += min(6, 2 + len(_interesting_created_details(dynamic_result)))
     if dynamic_result.get("timed_out"):
         dynamic_bonus += 2
 
@@ -624,7 +735,7 @@ def calculate_score(scored_files: list[dict], dynamic_result: dict) -> dict[str,
     pre_penalty_score = min(100, round(max_score * 0.45 + top3_avg * 0.15 + distribution + dynamic_bonus))
     benign_penalty = int(archive_profile.get("benign_penalty") or 0)
     raw_score = max(0, pre_penalty_score - benign_penalty)
-    strong_override = bool(dynamic_result.get("ransomware_signal")) or (dynamic_result.get("network_signal") and dynamic_result.get("persistence_signal")) or malicious_count >= 2
+    strong_override = bool(dynamic_result.get("ransomware_signal")) or ((network_strength == 2) and dynamic_result.get("persistence_signal")) or malicious_count >= 2
     if strong_override:
         raw_score = max(raw_score, 72)
     if archive_profile.get("developer_heavy") and not strong_override and malicious_count == 0 and suspicious_count == 0:

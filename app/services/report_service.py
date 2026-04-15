@@ -221,11 +221,17 @@ def process_report(report_id: str) -> dict:
 
         if bool(settings.sandbox_require_dynamic_success):
             exec_count = int(dynamic_result.get("archive_member_exec_count", 0) or 0)
+            attempted_count = int(dynamic_result.get("archive_member_attempted_count", 0) or 0)
+            failed_count = int(dynamic_result.get("archive_member_failed_count", 0) or 0)
             analysis_state = str(dynamic_result.get("analysis_state", "")).lower()
             if analysis_state == "static_only":
-                raise RuntimeError("dynamic_analysis_required_but_not_executed")
+                dynamic_result["analysis_state"] = "partial"
+                dynamic_result["dynamic_status"] = "not_executed"
+                dynamic_result["dynamic_reason"] = "static_only"
             if exec_count <= 0 and not bool(dynamic_result.get("exec_signal")):
-                raise RuntimeError("dynamic_analysis_required_but_no_member_executed")
+                dynamic_result["analysis_state"] = "partial"
+                dynamic_result["dynamic_status"] = "not_executed"
+                dynamic_result["dynamic_reason"] = "members_attempted_but_no_successful_execution" if (attempted_count > 0 or failed_count > 0) else "no_member_executed"
 
         scored_files = assess_files(static_results, dynamic_result)
         verdict = calculate_score(scored_files, dynamic_result)
@@ -255,7 +261,9 @@ def process_report(report_id: str) -> dict:
             f"{original_filename} analyzed as {verdict['verdict'].upper()} with risk score {verdict['score']}/100 "
             f"(static={verdict.get('static_score', 0)}, dynamic={verdict.get('dynamic_score', 0)}). "
             f"Executed archive members: {dynamic_result.get('archive_member_exec_count', 0)}. "
+            f"Failed archive members: {dynamic_result.get('archive_member_failed_count', 0)}. "
             f"Skipped archive members: {dynamic_result.get('archive_member_skipped_count', 0)}."
+            + (f" Dynamic note: {dynamic_result.get('dynamic_reason')}." if dynamic_result.get('dynamic_reason') else "")
             + (" Developer-heavy archive discount applied." if verdict.get("developer_heavy") else "")
             + (" Strong evidence override applied." if verdict.get("strong_override") else "")
             + (" Runtime timeout observed." if final_status == "timeout" else "")
