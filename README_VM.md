@@ -72,20 +72,13 @@ Inside VM disable:
 - Sleep / Hibernate
 - Controlled Folder Access
 
-Reason:
-Samples may be blocked, quarantined, or prevented from launching.
-
 ## 7. Required Packages
 
 ### VMware Tools
 
-VMware menu:
-
 ```text
 VM > Install VMware Tools
 ```
-
-Reboot after installation.
 
 ### Microsoft Visual C++ Redistributable
 
@@ -102,16 +95,10 @@ Recommended:
 Python 3.10 x64
 ```
 
-Enable during install:
+Enable:
 
 ```text
 Add Python to PATH
-```
-
-Verify:
-
-```cmd
-python --version
 ```
 
 ## 8. Shared Folder
@@ -122,16 +109,10 @@ Host path:
 host_bridge\workspace\shared
 ```
 
-Guest shared folder name must be:
+Guest shared folder name:
 
 ```text
 shared
-```
-
-Verify inside VM:
-
-```cmd
-dir "\\vmware-host\Shared Folders\shared"
 ```
 
 ## 9. Guest Agent
@@ -155,7 +136,24 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 .\bootstrap_guest.ps1
 ```
 
-## 10. Validation
+## 10. After Modifying guest_agent.py
+
+Apply changes by restarting the agent.
+
+```powershell
+taskkill /F /IM python.exe
+Stop-ScheduledTask -TaskName SandboxGuestAgent
+Start-ScheduledTask -TaskName SandboxGuestAgent
+Get-CimInstance Win32_Process | where {$_.Name -eq "python.exe"} | select CommandLine
+```
+
+Expected command line:
+
+```text
+"C:\Users\<user>\AppData\Local\Programs\Python\Python310\python.exe" "C:\sandbox_agent\guest_agent.py"
+```
+
+## 11. Validation
 
 ```powershell
 Get-ScheduledTask -TaskName SandboxGuestAgent
@@ -165,44 +163,22 @@ Get-ScheduledTask -TaskName SandboxGuestAgent
 dir C:\sandbox_work
 ```
 
-Heartbeat files should exist.
+## 12. Snapshot
 
-## 11. Snapshot
-
-After everything works:
-
-```text
-VMware > Snapshot > Take Snapshot
-```
-
-Snapshot name:
+Create snapshot after validation.
 
 ```text
 clean
 ```
 
-## 12. Common Mistakes
-
-- VM stored in Documents\Virtual Machines
-- Wrong VM name
-- Windows Home edition used
-- Snapshot created before Guest Agent install
-- Shared folder name mismatch
-- VMware Tools missing
-- Python PATH missing
-- Defender still enabled
-- Only x64 VC++ installed
-
 ## 13. Final Checklist
 
 - VM folder = `C:\Win10x64`
-- VMX path = `C:\Win10x64\Win10x64.vmx`
 - VM name = `Win10x64`
-- OS = Windows 10 Pro x64
+- Windows 10 Pro x64
 - VMware Tools installed
 - VC++ x64/x86 installed
 - Python installed
-- Security protections disabled
 - Shared folder works
 - Guest Agent running
-- Snapshot `clean` created
+- Snapshot `clean`
