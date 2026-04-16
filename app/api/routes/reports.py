@@ -337,9 +337,10 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
         tags = ", ".join(str(x) for x in entry.get("malware_type_tags", [])[:4]) or "-"
         yara = ", ".join(str(x) for x in entry.get("yara_matches", [])[:3] if not str(x).startswith("yara_error:")) or "-"
         evidence = "; ".join(str(x) for x in entry.get("top_evidence", [])[:2]) or "-"
-        attempted = bool(entry.get("member_runtime", {}).get("attempted"))
-        succeeded = bool(entry.get("member_runtime", {}).get("succeeded")) or bool(entry.get("executed"))
-        failed = bool(entry.get("member_runtime", {}).get("failed"))
+        member_runtime = _as_dict(entry.get("member_runtime"))
+        attempted = bool(member_runtime.get("attempted"))
+        succeeded = bool(member_runtime.get("succeeded")) or bool(entry.get("executed"))
+        failed = bool(member_runtime.get("failed"))
         executed = "success" if succeeded else ("failed" if failed else "no")
         attempt = "yes" if attempted else "no"
         top_file_rows += (
