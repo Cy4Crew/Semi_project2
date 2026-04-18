@@ -1,0 +1,11 @@
+<Sysmon schemaversion="4.91">
+  <EventFiltering>
+    <RuleGroup name="" groupRelation="or">
+      <ProcessCreate onmatch="exclude"/>
+      <NetworkConnect onmatch="exclude"/>
+      <ImageLoad onmatch="exclude"/>
+      <FileCreate onmatch="exclude"/>
+      <RegistryEvent onmatch="exclude"/>
+    </RuleGroup>
+  </EventFiltering>
+</Sysmon>
