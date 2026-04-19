@@ -69,6 +69,19 @@ def _evidence(category: str, signal: str, weight: int, source: str, detail: str)
         "summary": f"[{category}] {signal}: {detail}",
     }
 
+def _dynamic_context(dynamic_result: dict[str, Any]) -> dict[str, Any]:
+    sysmon_summary = dynamic_result.get("sysmon_summary") or {}
+    anti_signals = sysmon_summary.get("anti_analysis_signals") or dynamic_result.get("anti_analysis_signals") or []
+    registry_changes = sysmon_summary.get("registry_changes") or dynamic_result.get("registry_diff", {}).get("added") or []
+    network_endpoints = sysmon_summary.get("network_endpoints") or dynamic_result.get("network_trace", {}).get("endpoints") or []
+    return {
+        "execution_observed": bool(dynamic_result.get("execution_observed")) or bool(sysmon_summary.get("execution_observed")),
+        "anti_analysis": bool(dynamic_result.get("anti_analysis_signal")) or bool(anti_signals),
+        "anti_signals": anti_signals,
+        "registry_changes": registry_changes,
+        "network_endpoints": network_endpoints,
+    }
+
 
 def _member_behavior(member: dict[str, Any] | None, path: str) -> dict[str, Any]:
     if not member:
@@ -76,6 +89,8 @@ def _member_behavior(member: dict[str, Any] | None, path: str) -> dict[str, Any]
             "executed": False,
             "attempted": False,
             "av_blocked": False,
+            "execution_observed": False,
+            "anti_analysis": False,
             "score": 0,
             "reasons": [],
             "evidence": [],
@@ -84,6 +99,9 @@ def _member_behavior(member: dict[str, Any] | None, path: str) -> dict[str, Any]
     attempted = bool(member.get("attempted"))
     succeeded = bool(member.get("succeeded"))
     skip_reason = str(member.get("skip_reason") or "").lower()
+    execution_observed = bool(member.get("execution_observed")) or bool(succeeded)
+    anti_analysis = bool(member.get("anti_analysis"))
+    sysmon_summary = member.get("sysmon_summary") or {}
 
     av_blocked = False
     if "winerror 225" in skip_reason or "virus" in skip_reason or "user consent" in skip_reason:
@@ -107,10 +125,23 @@ def _member_behavior(member: dict[str, Any] | None, path: str) -> dict[str, Any]
             reasons.append("execution attempted")
             evidence.append(_evidence("dynamic", "execution_attempt", 4, path, "member execution attempted"))
 
+    if execution_observed and not succeeded:
+        score += 10
+        reasons.append("observed post-launch behavior")
+        evidence.append(_evidence("dynamic", "observed_behavior", 10, path, "behavior observed after launch"))
+
+    if anti_analysis:
+        anti_count = int(sysmon_summary.get("anti_analysis_count") or 1)
+        score += 30
+        reasons.append("anti-analysis behavior")
+        evidence.append(_evidence("dynamic", "anti_analysis", 30, path, f"task manager kill or similar behavior observed ({anti_count})"))
+
     return {
         "executed": succeeded,
         "attempted": attempted,
         "av_blocked": av_blocked,
+        "execution_observed": execution_observed,
+        "anti_analysis": anti_analysis,
         "score": score,
         "reasons": reasons,
         "evidence": evidence,
@@ -140,6 +171,7 @@ def calculate_file_assessment(static_item: dict[str, Any], dynamic_result: dict[
     member_map = member_result_map(dynamic_result)
     member = member_map.get(path) or member_map.get(Path(path).name)
     behavior = _member_behavior(member, path)
+    ctx = _dynamic_context(dynamic_result)
 
     score = 0
     reasons: list[str] = []
@@ -182,6 +214,26 @@ def calculate_file_assessment(static_item: dict[str, Any], dynamic_result: dict[
     reasons.extend(behavior["reasons"])
     evidence.extend(behavior["evidence"])
 
+    if ctx["anti_analysis"]:
+        score = max(score, MALICIOUS_EXEC_FLOOR)
+        reasons.append("anti-analysis signal in dynamic telemetry")
+        evidence.append(_evidence("dynamic", "anti_analysis_global", 35, path, "taskkill/taskmgr or similar anti-analysis behavior observed"))
+
+    if ctx["execution_observed"] and suffix == ".exe" and not behavior["executed"]:
+        score = max(score, SUSPICIOUS_EXEC_FLOOR)
+        reasons.append("execution observed via telemetry")
+        evidence.append(_evidence("dynamic", "execution_observed", 16, path, "telemetry observed even without clean success return code"))
+
+    if ctx["registry_changes"]:
+        score += 8
+        reasons.append("registry modifications observed")
+        evidence.append(_evidence("dynamic", "registry_change", 8, path, f"observed {len(ctx['registry_changes'])} registry changes"))
+
+    if ctx["network_endpoints"]:
+        score += 8
+        reasons.append("network activity observed")
+        evidence.append(_evidence("dynamic", "network_activity", 8, path, f"observed {len(ctx['network_endpoints'])} network endpoints"))
+
     av_blocked = bool(behavior.get("av_blocked"))
     suspicious_static_combo = bool(suspicious_imports) and entropy >= float(getattr(settings, "entropy_threshold", 7.2) or 7.2)
     suspicious_signal = suspicious_static_combo or bool(families) or bool(yara_hits)
@@ -211,7 +263,8 @@ def calculate_file_assessment(static_item: dict[str, Any], dynamic_result: dict[
             "malware_type_tags": tags,
             "primary_malware_type": (tags or ["unknown"])[0],
             "summary_reasons": list(dict.fromkeys(reasons))[:10],
-            "executed": behavior["executed"],
+            "executed": behavior["executed"] or behavior.get("execution_observed"),
+            "anti_analysis": behavior.get("anti_analysis") or ctx.get("anti_analysis"),
             "top_evidence": [x["summary"] for x in sorted(evidence, key=lambda e: abs(int(e.get("weight", 0))), reverse=True)[:3]],
             "evidence_items": sorted(evidence, key=lambda e: abs(int(e.get("weight", 0))), reverse=True)[:12],
             "severity": _severity_from_score(final_score),
@@ -245,11 +298,22 @@ def calculate_score(scored_files: list[dict[str, Any]], dynamic_result: dict[str
     review = sum(1 for x in scored_files if x.get("final_verdict") == "review")
 
     distribution = min(12, malicious * 4 + suspicious * 2 + review)
-    dynamic_bonus = 6 if int(dynamic_result.get("archive_member_success_count", 0)) > 0 else 0
+    sysmon_summary = dynamic_result.get("sysmon_summary") or {}
+    anti_analysis = bool(dynamic_result.get("anti_analysis_signal")) or bool(sysmon_summary.get("anti_analysis_signals"))
+    observed = bool(dynamic_result.get("execution_observed")) or bool(sysmon_summary.get("execution_observed"))
+    dynamic_bonus = 0
+    if int(dynamic_result.get("archive_member_success_count", 0)) > 0:
+        dynamic_bonus += 6
+    if observed:
+        dynamic_bonus += 6
+    if anti_analysis:
+        dynamic_bonus += 18
 
     raw = round(max_score * 0.55 + avg3 * 0.20 + distribution + dynamic_bonus)
 
-    if malicious:
+    if anti_analysis:
+        raw = max(raw, MALICIOUS_EXEC_FLOOR)
+    elif malicious:
         raw = max(raw, max_score)
     elif suspicious:
         raw = max(raw, 45)
