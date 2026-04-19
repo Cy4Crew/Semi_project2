@@ -20,7 +20,7 @@ WORK_DIR = Path(os.environ.get("VM_WORK_DIR", r"C:\sandbox_work")).resolve()
 POLL_SECONDS = int(os.environ.get("VM_AGENT_POLL_SECONDS", "3"))
 SHARED_DIR = Path(os.environ.get("VM_SHARED_DIR") or r"\\vmware-host\Shared Folders\shared")
 try:
-    from sysmon_collector import collect_sysmon_events, clear_sysmon_log, summarize_sysmon_events
+    from sysmon_collector import collect_sysmon_events, clear_sysmon_log
     SYSMON_AVAILABLE = True
 except ImportError:
     SYSMON_AVAILABLE = False
@@ -434,11 +434,31 @@ def _sample_process_state(root_pid: int, path: Path) -> tuple[list[dict], list[d
     netrows: list[dict] = []
     if root_pid <= 0:
         return tree, netrows
+
+    related_markers = {str(path).lower(), str(path.name).lower(), str(path.parent).lower()}
+    procs: list[psutil.Process] = []
     try:
         root = psutil.Process(root_pid)
-        procs = [root] + root.children(recursive=True)
+        procs.extend([root] + root.children(recursive=True))
     except Exception:
-        procs = []
+        pass
+
+    # start/cmd 로 분기된 짧은 자식 프로세스는 마지막 샘플 시점에 root.children()에서 사라질 수 있어
+    # 최근 생성 + 같은 작업 폴더/스크립트 경로를 가진 프로세스를 추가로 모아 놓침을 줄인다.
+    now = time.time()
+    for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "create_time"]):
+        try:
+            info = proc.info
+            cmdline_parts = info.get("cmdline") or []
+            cmdline = " ".join(cmdline_parts).lower()
+            create_time = float(info.get("create_time") or 0.0)
+            recent = create_time > 0 and (now - create_time) <= max(20.0, float(POLL_SECONDS) * 8.0)
+            related = any(marker and marker in cmdline for marker in related_markers)
+            if related or recent and int(info.get("ppid") or 0) == root_pid:
+                procs.append(proc)
+        except Exception:
+            continue
+
     seen = set()
     for proc in procs:
         try:
@@ -457,8 +477,9 @@ def _sample_process_state(root_pid: int, path: Path) -> tuple[list[dict], list[d
                     netrows.append({'pid': proc.pid, 'remote_ip': str(remote_ip), 'remote_port': int(remote_port or 0), 'status': str(conn.status)})
         except Exception:
             continue
-    return tree[:40], netrows[:40]
 
+    tree.sort(key=lambda x: (int(x.get('ppid') or 0), int(x.get('pid') or 0), str(x.get('name') or '').lower()))
+    return tree[:80], netrows[:80]
 
 def _is_noise_created_path(path_str: str) -> bool:
     lower = str(path_str or '').replace('/', '\\').lower()
@@ -544,8 +565,22 @@ def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[d
             creationflags=CREATE_NO_WINDOW,
         )
         deadline = time.time() + timeout_seconds
+        seen_tree: set[tuple[int, int, str, str]] = set()
+        seen_net: set[tuple[int, str, int, str]] = set()
         while True:
-            process_tree_live, network_endpoints_live = _sample_process_state(proc.pid, path)
+            sampled_tree, sampled_net = _sample_process_state(proc.pid, path)
+            for row in sampled_tree:
+                key = (int(row.get('pid') or 0), int(row.get('ppid') or 0), str(row.get('name') or ''), str(row.get('cmdline') or ''))
+                if key in seen_tree:
+                    continue
+                seen_tree.add(key)
+                process_tree_live.append(row)
+            for row in sampled_net:
+                key = (int(row.get('pid') or 0), str(row.get('remote_ip') or ''), int(row.get('remote_port') or 0), str(row.get('status') or ''))
+                if key in seen_net:
+                    continue
+                seen_net.add(key)
+                network_endpoints_live.append(row)
             if proc.poll() is not None:
                 break
             if time.time() >= deadline:
@@ -622,7 +657,6 @@ def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[d
         "process_tree_live": process_tree_live,
         "network_endpoints_live": network_endpoints_live,
     }
-
 
 def maybe_capture_memory_dump(proc_items: list[dict], outbox: Path, timeline: list[dict]) -> list[dict]:
     procdump = os.environ.get("PROCDUMP_PATH", r"C:\Tools\Sysinternals\procdump64.exe")
@@ -776,7 +810,6 @@ def analyze_job(job_dir: Path) -> dict:
 
     guest_job_root = WORK_DIR / report_id
     timeline: list[dict] = []
-    started_at = time.time()
     append_timeline(timeline, "job_begin", report_id=report_id, sample_name=sample_name)
 
     if guest_job_root.exists():
@@ -886,51 +919,9 @@ def analyze_job(job_dir: Path) -> dict:
     external_monitor = collect_external_monitor_logs(outbox, timeline)
 
     registry_diff = diff_registry_snapshot(before_registry, after_registry)
-    sysmon_events = collect_sysmon_events(after_ts=started_at, max_events=160) if SYSMON_AVAILABLE else []
-    sysmon_summary = summarize_sysmon_events(sysmon_events, [m.get("path") for m in member_results]) if SYSMON_AVAILABLE else {
-        "event_count": 0,
-        "matched_event_count": 0,
-        "execution_observed": False,
-        "process_tree": [],
-        "registry_changes": [],
-        "network_endpoints": [],
-        "dns_queries": [],
-        "anti_analysis_signals": [],
-        "image_loads": [],
-    }
+    sysmon_events = collect_sysmon_events() if SYSMON_AVAILABLE else []
     scheduled_task_diff = diff_named_items(before_tasks, after_tasks)
     service_diff = diff_named_items(before_services, after_services)
-
-    if sysmon_summary.get("process_tree"):
-        existing = {(x.get("pid"), x.get("name"), x.get("cmdline")) for x in process_delta.get("new_process_tree", [])}
-        for row in sysmon_summary.get("process_tree", []):
-            key = (row.get("pid"), row.get("name"), row.get("cmdline"))
-            if key not in existing:
-                process_delta.setdefault("new_process_tree", []).append({
-                    "pid": row.get("pid"),
-                    "ppid": None,
-                    "name": row.get("name"),
-                    "cmdline": row.get("cmdline"),
-                })
-    if sysmon_summary.get("anti_analysis_signals"):
-        for signal in sysmon_summary.get("anti_analysis_signals", []):
-            cmdline = str(signal.get("command_line") or signal.get("image") or "")[:300]
-            marker = {
-                "pid": None,
-                "name": Path(str(signal.get("image") or "taskkill.exe")).name,
-                "cmdline": cmdline,
-            }
-            if marker not in process_delta.get("suspicious_processes", []):
-                process_delta.setdefault("suspicious_processes", []).append(marker)
-    if sysmon_summary.get("network_endpoints"):
-        existing = {(x.get("pid"), x.get("remote_ip"), x.get("remote_port"), x.get("status")) for x in network_trace.get("endpoints", [])}
-        for row in sysmon_summary.get("network_endpoints", []):
-            key = (row.get("pid"), row.get("remote_ip"), row.get("remote_port"), row.get("status"))
-            if key not in existing:
-                network_trace.setdefault("endpoints", []).append(row)
-        network_trace["connection_count"] = len(network_trace.get("endpoints", []))
-    network_trace["dns_queries"] = sysmon_summary.get("dns_queries", [])[:40]
-    network_trace["anti_analysis_signals"] = sysmon_summary.get("anti_analysis_signals", [])[:20]
 
     combined = "\n\n".join(
         (m.get("stdout_preview", "") + "\n" + m.get("stderr_preview", "")).strip()
@@ -941,16 +932,13 @@ def analyze_job(job_dir: Path) -> dict:
     created_lower = "\n".join(c["path"].lower() for c in created_details)
 
     successful_members = [m for m in member_results if m.get("succeeded")]
-    anti_analysis_signal = bool(sysmon_summary.get("anti_analysis_signals")) or "taskkill /f /im taskmgr.exe" in combined_l
-    execution_observed = bool(successful_members) or bool(process_delta["suspicious_processes"]) or bool(sysmon_summary.get("execution_observed"))
-    exec_signal = execution_observed or any(k in combined_l for k in ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript"])
+    exec_signal = bool(successful_members) or bool(process_delta["suspicious_processes"]) or any(k in combined_l for k in ["powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "wscript", "cscript"])
     persistence_signal = (
         any(k in combined_l for k in [r"currentversion\run", "runonce", "schtasks", "startup"])
         or any("startup_drop" == c["category"] for c in created_details)
         or bool(scheduled_task_diff.get("added"))
         or bool(service_diff.get("added"))
         or bool(registry_diff.get("added"))
-        or bool(sysmon_summary.get("registry_changes"))
         or "scheduledtasks" in created_lower
     )
     file_signal = bool([c for c in created_details if c.get("category") not in {"other_drop"}])
@@ -977,8 +965,6 @@ def analyze_job(job_dir: Path) -> dict:
         score += 25
     if dropped_exec_candidates:
         score += min(10, len(dropped_exec_candidates) * 2)
-    if anti_analysis_signal:
-        score += 30
     score = min(score, 100)
 
     append_timeline(
@@ -994,21 +980,6 @@ def analyze_job(job_dir: Path) -> dict:
     for item in member_results:
         pkg = str(item.get('package') or 'generic')
         package_counts[pkg] = package_counts.get(pkg, 0) + 1
-        item["execution_observed"] = bool(item.get("succeeded")) or bool(sysmon_summary.get("execution_observed"))
-        item["anti_analysis"] = anti_analysis_signal
-        item["sysmon_summary"] = {
-            "matched_event_count": sysmon_summary.get("matched_event_count", 0),
-            "anti_analysis_count": len(sysmon_summary.get("anti_analysis_signals", [])),
-            "registry_change_count": len(sysmon_summary.get("registry_changes", [])),
-            "network_endpoint_count": len(sysmon_summary.get("network_endpoints", [])),
-        }
-
-    dynamic_status = "executed" if execution_observed else ("attempted" if any(m.get("attempted") for m in member_results) else "not_executed")
-    dynamic_reason = None
-    if not execution_observed:
-        dynamic_reason = "members_attempted_but_no_observed_behavior" if any(m.get("attempted") for m in member_results) else "no_member_executed"
-    elif anti_analysis_signal:
-        dynamic_reason = "anti_analysis_behavior_observed"
 
     result = {
         "returncode": 0 if all(not m.get("timed_out") for m in member_results) else -1,
@@ -1023,11 +994,6 @@ def analyze_job(job_dir: Path) -> dict:
         "network_trace": network_trace,
         "network_signal": network_signal,
         "exec_signal": exec_signal,
-        "execution_observed": execution_observed,
-        "dynamic_status": dynamic_status,
-        "dynamic_reason": dynamic_reason,
-        "sysmon_summary": sysmon_summary,
-        "anti_analysis_signal": anti_analysis_signal,
         "persistence_signal": persistence_signal,
         "file_signal": file_signal,
         "ransomware_signal": ransomware_signal or note_signal,
