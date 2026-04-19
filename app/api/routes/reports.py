@@ -284,6 +284,131 @@ def report_artifact_file(report_id: str, path: str, token: str | None = Query(de
 
 
 
+def _normalize_process_rows(rows: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pid = int(row.get("pid") or 0)
+        ppid = int(row.get("ppid") or 0)
+        name = str(row.get("name") or "")
+        cmdline = str(row.get("cmdline") or "")
+        out.append({"pid": pid, "ppid": ppid, "name": name, "cmdline": cmdline})
+    return out
+
+
+def _build_process_tree_rows(rows: list[dict], limit: int = 40) -> list[dict]:
+    nodes = _normalize_process_rows(rows)
+    if not nodes:
+        return []
+
+    by_pid = {node["pid"]: node for node in nodes if node["pid"] > 0}
+    children: dict[int, list[dict]] = {}
+    for node in nodes:
+        children.setdefault(node["ppid"], []).append(node)
+
+    def sort_key(node: dict):
+        return (str(node.get("name") or "").lower(), int(node.get("pid") or 0))
+
+    for key in list(children):
+        children[key] = sorted(children[key], key=sort_key)
+
+    roots: list[dict] = []
+    for node in nodes:
+        pid = node["pid"]
+        ppid = node["ppid"]
+        if pid <= 0 or ppid <= 0 or ppid == pid or ppid not in by_pid:
+            roots.append(node)
+    roots = sorted({node["pid"]: node for node in roots}.values(), key=sort_key)
+
+    ordered: list[dict] = []
+    seen: set[int] = set()
+
+    def walk(node: dict, depth: int):
+        pid = node["pid"]
+        if pid in seen:
+            return
+        seen.add(pid)
+        ordered.append({**node, "depth": depth})
+        for child in children.get(pid, []):
+            walk(child, depth + 1)
+
+    for root in roots:
+        walk(root, 0)
+    for node in sorted(nodes, key=sort_key):
+        if node["pid"] not in seen:
+            walk(node, 0)
+
+    return ordered[:limit]
+
+
+def _detect_spawn_events(rows: list[dict], limit: int = 20) -> list[dict]:
+    nodes = _normalize_process_rows(rows)
+    if not nodes:
+        return []
+
+    by_pid = {node["pid"]: node for node in nodes if node["pid"] > 0}
+    suspicious_children = {
+        "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe",
+        "mshta.exe", "rundll32.exe", "regsvr32.exe", "wmic.exe"
+    }
+    script_tokens = {".bat", ".cmd", ".ps1", ".vbs", ".js", ".jse", ".wsf", ".hta"}
+
+    events: list[dict] = []
+    seen: set[tuple[int, int, str]] = set()
+    for node in nodes:
+        pid = int(node.get("pid") or 0)
+        ppid = int(node.get("ppid") or 0)
+        parent = by_pid.get(ppid, {})
+        child_name = str(node.get("name") or "").strip()
+        child_name_l = child_name.lower()
+        child_cmd = str(node.get("cmdline") or "").strip()
+        child_cmd_l = child_cmd.lower()
+        parent_name = str(parent.get("name") or "unknown").strip()
+        parent_name_l = parent_name.lower()
+        reasons: list[str] = []
+
+        if child_name_l in suspicious_children:
+            reasons.append(f"spawned {child_name_l}")
+        if any(tok in child_cmd_l for tok in script_tokens):
+            reasons.append("script execution")
+        if parent_name_l.endswith(("winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "acrord32.exe")) and (
+            child_name_l in suspicious_children or any(tok in child_cmd_l for tok in script_tokens)
+        ):
+            reasons.append("office/document parent")
+
+        if not reasons:
+            continue
+
+        key = (ppid, pid, child_name_l)
+        if key in seen:
+            continue
+        seen.add(key)
+        events.append({
+            "parent_pid": ppid,
+            "parent_name": parent_name or "unknown",
+            "pid": pid,
+            "name": child_name or "unknown",
+            "cmdline": child_cmd,
+            "reason": ", ".join(reasons),
+        })
+
+    events.sort(key=lambda x: (str(x.get("parent_name") or "").lower(), int(x.get("parent_pid") or 0), int(x.get("pid") or 0)))
+    return events[:limit]
+
+
+def _build_process_tree_payload(rows: list[dict], limit: int = 200) -> dict:
+    ordered = _build_process_tree_rows(rows, limit=limit)
+    spawns = _detect_spawn_events(rows, limit=limit)
+    return {
+        "process_tree": ordered,
+        "spawn_events": spawns,
+        "summary": {
+            "process_count": len(ordered),
+            "spawn_event_count": len(spawns),
+        },
+    }
+
 def _render_kv_table(data: dict, title_left: str = "Key", title_right: str = "Value") -> str:
     rows = "".join(f"<tr><td>{_e(k)}</td><td>{_e(v)}</td></tr>" for k, v in data.items())
     if not rows:
@@ -361,6 +486,23 @@ def _filter_display_evidence(evidence_list: list[dict]) -> list[dict]:
     return out
 
 
+@router.get("/{report_id}/process-tree")
+def report_process_tree(report_id: str, token: str | None = Query(default=None)):
+    if not _artifact_access_allowed(token):
+        raise HTTPException(status_code=403, detail="artifact access denied")
+    item = get_report(report_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Report not found")
+    dynamic_result = _as_dict(item.get("dynamic_result"))
+    evidence_bundle = _as_dict(item.get("evidence_bundle"))
+    process_tree = _as_list(evidence_bundle.get("process_tree") or _as_dict(dynamic_result.get("process_delta")).get("new_process_tree"))
+    payload = _build_process_tree_payload(process_tree, limit=200)
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="process_tree_{report_id}.json"'},
+    )
+
 @router.get("/{report_id}/view", response_class=HTMLResponse)
 def report_view(report_id: str, token: str | None = Query(default=None)):
     if not _artifact_access_allowed(token):
@@ -402,6 +544,9 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     dropped_files_raw = _as_list(evidence_bundle.get("dropped_files") or _as_dict(dynamic_result.get("filesystem_delta")).get("created_details"))
     dropped_files = _display_drop_rows(dropped_files_raw)
     process_tree = _as_list(evidence_bundle.get("process_tree") or _as_dict(dynamic_result.get("process_delta")).get("new_process_tree"))
+    process_tree_payload = _build_process_tree_payload(process_tree, limit=200)
+    process_tree_rows = _as_list(process_tree_payload.get("process_tree"))[:50]
+    spawn_events = _as_list(process_tree_payload.get("spawn_events"))[:20]
     memory_dumps = _as_list(evidence_bundle.get("memory_dumps") or dynamic_result.get("memory_dumps"))
     timeline = _as_list(dynamic_result.get("timeline"))
 
@@ -479,8 +624,11 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
         f"<tr><td>{_e(x.get('path', '-'))}</td><td>{_e(x.get('category', '-'))}</td></tr>" for x in dropped_files[:25]
     ) or "<tr><td colspan='2' class='muted'>No dropped files recorded.</td></tr>"
     process_rows = "".join(
-        f"<tr><td>{_e(x.get('pid', '-'))}</td><td>{_e(x.get('name', '-'))}</td><td>{_e(x.get('cmdline', '-'))}</td></tr>" for x in process_tree[:20]
-    ) or "<tr><td colspan='3' class='muted'>No new process tree recorded.</td></tr>"
+        f"<tr><td>{_e(x.get('pid', '-'))}</td><td>{_e(x.get('ppid', '-'))}</td><td class='proc-name'>{'&nbsp;&nbsp;&nbsp;&nbsp;' * int(x.get('depth', 0) or 0)}{'└─ ' if int(x.get('depth', 0) or 0) > 0 else ''}{_e(x.get('name', '-'))}</td><td>{_e(x.get('cmdline', '-'))}</td></tr>" for x in process_tree_rows
+    ) or "<tr><td colspan='4' class='muted'>No new process tree recorded.</td></tr>"
+    spawn_rows = "".join(
+        f"<tr><td>{_e(x.get('parent_pid', '-'))}</td><td>{_e(x.get('parent_name', '-'))}</td><td>{_e(x.get('pid', '-'))}</td><td>{_e(x.get('name', '-'))}</td><td>{_e(x.get('reason', '-'))}</td><td>{_e(x.get('cmdline', '-'))}</td></tr>" for x in spawn_events
+    ) or "<tr><td colspan='6' class='muted'>No suspicious cmd/powershell/script spawn detected.</td></tr>"
     network_rows = "".join(
         f"<tr><td>{_e(x.get('pid', '-'))}</td><td>{_e(x.get('remote_ip', '-'))}</td><td>{_e(x.get('remote_port', '-'))}</td><td>{_e(x.get('status', '-'))}</td></tr>" for x in network_endpoints[:20]
     ) or "<tr><td colspan='4' class='muted'>No network endpoints recorded.</td></tr>"
@@ -528,7 +676,7 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     .hero,.grid,.metrics,.detail-grid{{display:grid;gap:16px}} .hero{{grid-template-columns:1.5fr .9fr}} .grid{{grid-template-columns:1fr 1fr}} .detail-grid{{grid-template-columns:1fr 1fr 1fr}} .metrics{{grid-template-columns:repeat(4,1fr)}} .metric{{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}} .metric span{{display:block;font-size:12px;color:var(--muted);margin-bottom:8px}} .metric strong{{font-size:24px}} .small-metric strong{{font-size:18px}}
     .badge{{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px}} .critical{{color:var(--critical);background:var(--critical-bg)}} .high{{color:var(--high);background:var(--high-bg)}} .medium{{color:var(--medium);background:var(--medium-bg)}} .low{{color:var(--low);background:var(--low-bg)}}
     .summary-list{{margin:0;padding-left:18px;line-height:1.7}} .ioc-grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px}} .ioc-block{{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}} .chips,.hashes,.toolbar{{display:flex;flex-wrap:wrap;gap:8px}} .chip,.tag{{display:inline-flex;padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:#fff;font-size:12px}} .muted{{color:var(--muted)}}
-    table{{width:100%;border-collapse:collapse;background:#fff}} th,td{{border-bottom:1px solid var(--line);padding:12px 10px;text-align:left;vertical-align:top}} th{{color:var(--muted);font-size:13px}} .file-col{{max-width:320px;word-break:break-word}} .sev{{display:inline-flex;padding:5px 9px;border-radius:999px;font-size:12px;font-weight:700;text-transform:capitalize}} pre{{white-space:pre-wrap;word-break:break-word;background:#0f172a;color:#e2e8f0;padding:14px;border-radius:12px;max-height:460px;overflow:auto}} code{{word-break:break-all}}
+    table{{width:100%;border-collapse:collapse;background:#fff}} th,td{{border-bottom:1px solid var(--line);padding:12px 10px;text-align:left;vertical-align:top}} .proc-name{{white-space:nowrap}} th{{color:var(--muted);font-size:13px}} .file-col{{max-width:320px;word-break:break-word}} .sev{{display:inline-flex;padding:5px 9px;border-radius:999px;font-size:12px;font-weight:700;text-transform:capitalize}} pre{{white-space:pre-wrap;word-break:break-word;background:#0f172a;color:#e2e8f0;padding:14px;border-radius:12px;max-height:460px;overflow:auto}} code{{word-break:break-all}}
     .toolbar{{margin-top:12px}} .btn{{display:inline-block;padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:#fff;text-decoration:none;color:var(--text);font-weight:700}} .btn-small{{padding:6px 10px;font-size:12px}} details{{margin-top:10px}} details summary{{cursor:pointer;font-weight:700}} .section-intro{{margin-top:4px;color:var(--muted)}}
     @media (max-width:980px){{.hero,.grid,.metrics,.detail-grid,.ioc-grid{{grid-template-columns:1fr}}}}
     </style></head><body><main class='page'>
@@ -545,6 +693,7 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
         <div class='toolbar'>
           <a class='btn' href='/api/reports/{_e(report_id)}' target='_blank' rel='noopener noreferrer'>Open JSON</a>
           <a class='btn' href='/api/reports/{_e(report_id)}/download'>Download JSON</a>
+          <a class='btn' href='/api/reports/{_e(report_id)}/process-tree'>Download process tree JSON</a>
           <a class='btn' href='/api/reports/{_e(report_id)}/evidence'>Download evidence</a>
         </div>
       </div>
@@ -557,7 +706,8 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
           <div class='metric'><span>Network endpoints</span><strong>{len(network_endpoints)}</strong></div>
           <div class='metric'><span>Dropped files</span><strong>{len(dropped_files)}</strong></div>
           <div class='metric'><span>Attempted exec</span><strong>{_e(dynamic_result.get('archive_member_attempted_count', 0))}</strong></div>
-          <div class='metric'><span>Processes</span><strong>{len(process_tree)}</strong></div>
+          <div class='metric'><span>Processes</span><strong>{len(process_tree_rows)}</strong></div>
+          <div class='metric'><span>Spawn alerts</span><strong>{len(spawn_events)}</strong></div>
           <div class='metric'><span>Family confidence</span><strong>{_e(family_confidence.upper())}</strong></div>
         </div>
       </div>
@@ -616,8 +766,14 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
       </div>
       <div class='card'>
         <h2>Process tree</h2>
-        <table><thead><tr><th>PID</th><th>Name</th><th>Cmdline</th></tr></thead><tbody>{process_rows}</tbody></table>
+        <table><thead><tr><th>PID</th><th>PPID</th><th>Name</th><th>Cmdline</th></tr></thead><tbody>{process_rows}</tbody></table>
       </div>
+    </section>
+
+    <section class='card'>
+      <h2>Suspicious spawns</h2>
+      <p class='section-intro'>cmd / powershell / script 계열 실행만 따로 묶어서 보여줍니다.</p>
+      <table><thead><tr><th>Parent PID</th><th>Parent</th><th>PID</th><th>Child</th><th>Reason</th><th>Cmdline</th></tr></thead><tbody>{spawn_rows}</tbody></table>
     </section>
 
     <section class='grid'>
