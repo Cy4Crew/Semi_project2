@@ -559,6 +559,12 @@ def calculate_file_assessment(static_item: dict, dynamic_result: dict) -> dict[s
     static_score = sum(v for k, v in breakdown.items() if k != "dynamic")
     raw_score = min(100, static_score + breakdown["dynamic"])
 
+    if behavior.get("executed") and behavior.get("network_signal"):
+        raw_score += 15
+        reasons.append("Executed file with network activity")
+    if behavior.get("executed") and behavior.get("persistence_signal"):
+        raw_score += 20
+        reasons.append("Executed file establishing persistence")
     if suffix in TEXTISH_SUFFIXES and not high_families and not yara_hits and breakdown["dynamic"] == 0:
         raw_score = min(raw_score, 16)
     if suffix in SOURCE_SUFFIXES and not high_families and not yara_hits and breakdown["dynamic"] == 0:
