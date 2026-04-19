@@ -765,6 +765,10 @@ def calculate_score(scored_files: list[dict], dynamic_result: dict) -> dict[str,
     pre_penalty_score = min(100, round(max_score * 0.45 + top3_avg * 0.15 + distribution + dynamic_bonus))
     benign_penalty = int(archive_profile.get("benign_penalty") or 0)
     raw_score = max(0, pre_penalty_score - benign_penalty)
+    if dynamic_result.get("ransomware_signal"):
+        raw_score = max(raw_score, 85)
+    if dynamic_result.get("persistence_signal") and dynamic_result.get("network_signal"):
+        raw_score = max(raw_score, 75)
     if dynamic_result.get("network_signal") and dynamic_result.get("persistence_signal"):
         raw_score = max(raw_score, 75)
     if dynamic_result.get("ransomware_signal"):
