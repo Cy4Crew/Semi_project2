@@ -374,7 +374,10 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
         "analysis_log_path": str(analysis_log_path),
         "trace_path": trace.get("trace_path"),
         "pcap_path": pcap_path,
+        # ── 4번: fs_monitor.py 수정으로 이제 각 항목이 {"path", "sha256"} dict 형태
         "filesystem_delta": fs_delta,
+        # ── 4번: 로컬 백엔드는 Windows 경로 스캔 불가 → 빈 리스트 (VMware 백엔드와 스키마 통일)
+        "dropped_files": [],
         "process_delta": {
             "before_count": len(proc_before),
             "after_count": len(proc_after),

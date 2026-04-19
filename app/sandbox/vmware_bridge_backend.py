@@ -14,6 +14,46 @@ from app.services.multi_vm_scheduler import MultiVMScheduler
 _SCHEDULER = MultiVMScheduler()
 
 
+def _merge_filesystem_delta(result: dict) -> dict:
+    """
+    guest_agent result.json 의 filesystem_delta 와
+    system_diff(TEMP/APPDATA/Startup 스캔) 를 합쳐 반환.
+
+    filesystem_delta.created 는 두 가지 포맷이 섞일 수 있음:
+      - 구 포맷: str (경로 문자열)
+      - 신 포맷: {"path": str, "sha256": str, "category": str, ...}
+    → 신 포맷으로 통일.
+    """
+    base_delta = result.get("filesystem_delta") or {}
+
+    def _normalize(items: list) -> list:
+        out = []
+        for item in items:
+            if isinstance(item, str):
+                out.append({"path": item, "sha256": "", "category": "other_drop"})
+            elif isinstance(item, dict):
+                out.append(item)
+        return out
+
+    created = _normalize(base_delta.get("created", []))
+    changed = _normalize(base_delta.get("changed", []))
+    deleted = _normalize(base_delta.get("deleted", []))
+
+    # system_diff 병합 (TEMP/APPDATA/Startup 스캔 결과)
+    system_diff = result.get("system_diff") or {}
+    existing_paths = {c["path"] for c in created}
+    for item in _normalize(system_diff.get("created", [])):
+        if item["path"] not in existing_paths:
+            created.append(item)
+            existing_paths.add(item["path"])
+    for item in _normalize(system_diff.get("changed", [])):
+        changed.append(item)
+    for item in _normalize(system_diff.get("deleted", [])):
+        deleted.append(item)
+
+    return {"created": created[:200], "changed": changed[:100], "deleted": deleted[:100]}
+
+
 def _submit_to_slot(slot, sample_path: str, report_id: str, artifact_root: str) -> dict:
     bridge_url = str(slot.bridge_url).rstrip('/')
     endpoint = f"{bridge_url}/submit"
@@ -47,7 +87,10 @@ def _submit_to_slot(slot, sample_path: str, report_id: str, artifact_root: str) 
         'analysis_log_path': str(raw_path),
         'trace_path': result.get('trace_path'),
         'pcap_path': result.get('pcap_path'),
-        'filesystem_delta': result.get('filesystem_delta', {'created': [], 'changed': [], 'deleted': []}),
+        # ── 4번: TEMP/APPDATA/Startup 스캔 결과 병합 + 포맷 통일
+        'filesystem_delta': _merge_filesystem_delta(result),
+        # ── 4번: guest_agent가 outbox에 저장한 dropped_files.json 내용 전달
+        'dropped_files': result.get('dropped_files', []),
         'process_delta': result.get('process_delta', {'before_count': 0, 'after_count': 0, 'new_processes_estimate': 0}),
         'network_trace': result.get('network_trace', {'disabled': True, 'reason': 'vmware_guest_agent'}),
         'timeline': result.get('timeline', []),

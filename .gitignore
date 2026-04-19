@@ -54,3 +54,5 @@ temp/
 # Archives
 *.tar
 *.gz
+
+.env
