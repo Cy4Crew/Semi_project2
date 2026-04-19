@@ -409,6 +409,7 @@ def _build_process_tree_payload(rows: list[dict], limit: int = 200) -> dict:
         },
     }
 
+
 def _render_kv_table(data: dict, title_left: str = "Key", title_right: str = "Value") -> str:
     rows = "".join(f"<tr><td>{_e(k)}</td><td>{_e(v)}</td></tr>" for k, v in data.items())
     if not rows:
@@ -503,6 +504,7 @@ def report_process_tree(report_id: str, token: str | None = Query(default=None))
         headers={"Content-Disposition": f'attachment; filename="process_tree_{report_id}.json"'},
     )
 
+
 @router.get("/{report_id}/view", response_class=HTMLResponse)
 def report_view(report_id: str, token: str | None = Query(default=None)):
     if not _artifact_access_allowed(token):
@@ -549,6 +551,10 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     spawn_events = _as_list(process_tree_payload.get("spawn_events"))[:20]
     memory_dumps = _as_list(evidence_bundle.get("memory_dumps") or dynamic_result.get("memory_dumps"))
     timeline = _as_list(dynamic_result.get("timeline"))
+    sysmon_summary = _as_dict(dynamic_result.get("sysmon_summary"))
+    sysmon_events = _as_list(dynamic_result.get("sysmon_events"))
+    anti_analysis_signals = _as_list(sysmon_summary.get("anti_analysis_signals") or _as_dict(dynamic_result.get("network_trace")).get("anti_analysis_signals"))
+    registry_changes = _as_list(sysmon_summary.get("registry_changes") or dynamic_result.get("registry_diff", {}).get("added"))
 
     failed_count = sum(1 for f in display_files if f.get("fail_reason") and f.get("fail_reason") not in {"not_executable", "document_execution_not_supported", "not_selected_for_execution"})
 
@@ -639,6 +645,15 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     timeline_rows = "".join(
         f"<tr><td>{_e(x.get('ts', '-'))}</td><td>{_e(x.get('stage', '-'))}</td><td>{_e(json.dumps({k: v for k, v in x.items() if k not in {'ts', 'stage'}}, ensure_ascii=False))}</td></tr>" for x in timeline[:20]
     ) or "<tr><td colspan='3' class='muted'>No timeline events recorded.</td></tr>"
+    anti_rows = "".join(
+        f"<tr><td>{_e(x.get('time', '-'))}</td><td>{_e(Path(str(x.get('image') or '')).name or x.get('image', '-'))}</td><td>{_e(x.get('command_line', '-'))}</td><td>{_e(x.get('parent_image', '-'))}</td></tr>" for x in anti_analysis_signals[:20]
+    ) or "<tr><td colspan='4' class='muted'>No anti-analysis signals recorded.</td></tr>"
+    registry_rows = "".join(
+        f"<tr><td>{_e(x.get('time', '-'))}</td><td>{_e(Path(str(x.get('image') or '')).name or x.get('image', '-'))}</td><td>{_e(x.get('target_object') or x.get('entry') or '-')}</td><td>{_e(x.get('details') or x.get('hive') or '-')}</td></tr>" for x in registry_changes[:20]
+    ) or "<tr><td colspan='4' class='muted'>No registry changes recorded.</td></tr>"
+    sysmon_event_rows = "".join(
+        f"<tr><td>{_e(x.get('time', '-'))}</td><td>{_e(x.get('event_id', '-'))}</td><td>{_e(Path(str(x.get('image') or '')).name or x.get('image', '-'))}</td><td>{_e(', '.join(x.get('tags') or []))}</td><td>{_e((x.get('command_line') or x.get('target_object') or x.get('message') or '-')[:220])}</td></tr>" for x in sysmon_events[:30]
+    ) or "<tr><td colspan='5' class='muted'>No Sysmon events recorded.</td></tr>"
 
     failure_section = ""
     if status.lower() in {"failed", "timeout", "killed"} or failure_detail or item.get("failure_reason"):
@@ -663,6 +678,8 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
         ("Memory dumps", len(memory_dumps)),
         ("Skipped exec", skipped_count),
         ("YARA hits", len(yara_matches)),
+        ("Sysmon events", len(sysmon_events)),
+        ("Anti-analysis", len(anti_analysis_signals)),
     ]
     advanced_metrics_html = "".join(f"<div class='metric small-metric'><span>{_e(label)}</span><strong>{_e(value)}</strong></div>" for label, value in advanced_metrics)
 
@@ -785,6 +802,22 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
         <h2>Execution timeline</h2>
         <table><thead><tr><th>Time</th><th>Stage</th><th>Detail</th></tr></thead><tbody>{timeline_rows}</tbody></table>
       </div>
+    </section>
+
+    <section class='grid'>
+      <div class='card'>
+        <h2>Anti-analysis signals</h2>
+        <table><thead><tr><th>Time</th><th>Image</th><th>Command</th><th>Parent</th></tr></thead><tbody>{anti_rows}</tbody></table>
+      </div>
+      <div class='card'>
+        <h2>Registry changes</h2>
+        <table><thead><tr><th>Time</th><th>Image</th><th>Target</th><th>Details</th></tr></thead><tbody>{registry_rows}</tbody></table>
+      </div>
+    </section>
+
+    <section class='card'>
+      <h2>Sysmon telemetry</h2>
+      <table><thead><tr><th>Time</th><th>ID</th><th>Image</th><th>Tags</th><th>Detail</th></tr></thead><tbody>{sysmon_event_rows}</tbody></table>
     </section>
 
     <section class='card'>
