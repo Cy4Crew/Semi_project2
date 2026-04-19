@@ -226,6 +226,30 @@ def _member_behavior(member_result: dict | None, path: str = "archive") -> dict[
         score += 3
         reasons.append("non-zero exit during execution")
         evidence_items.append(_evidence_entry("dynamic", "nonzero_exit", 3, path, f"process exited with return code {returncode}", "medium"))
+    if network_hits > 0 and persistence_hits > 0:
+        score += 25
+        reasons.append("C2 + Persistence chain detected")
+        evidence_items.append(_evidence_entry(
+            "dynamic",
+            "c2_persistence_chain",
+            25,
+            path,
+            "network + persistence behavior observed together",
+            "critical"
+        ))
+
+# Ransomware + 실행
+    if ransomware_hits > 0 and executed:
+        score += 40
+        reasons.append("Active ransomware execution")
+        evidence_items.append(_evidence_entry(
+            "dynamic",
+            "active_ransomware",
+            40,
+            path,
+            "ransomware behavior detected during execution",
+            "critical"
+        ))
     return {
         "executed": executed,
         "network_signal": network_hits > 0,
