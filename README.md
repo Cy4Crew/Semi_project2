@@ -35,6 +35,7 @@ Semi_project2 provides the following workflow:
 - IOC extraction including URLs, IPs, malware families, YARA, and file paths
 - Evidence-based scoring and verdict classification
 - Report UI with summary, evidence, behavior, IOC sections, and downloadable artifacts
+- Optional Sysmon-based telemetry for process, network, file, and registry events
 - Repeatable analysis flow using a `clean` snapshot
 
 ---
@@ -63,6 +64,7 @@ docker-compose.yml   App container startup
 run.bat              Main local startup entrypoint
 README_VM.md         Windows VM installation and preparation guide
 README_OPERATION.md  Detailed operational guide
+README_SYSMON.md     Sysmon telemetry setup and integration guide
 ```
 
 ---
@@ -79,6 +81,8 @@ The host bridge runs on the Windows host machine, talks to VMware through `vmrun
 
 ### 3. Guest VM Layer
 The guest agent runs inside the Windows VM, publishes heartbeat information, receives jobs from the host, executes supported files, collects runtime results, and writes the output back to the shared folder.
+
+When Sysmon is enabled, the guest can also export structured telemetry such as process creation, network connections, DLL loads, file creation, and registry modifications.
 
 ---
 
@@ -162,10 +166,12 @@ For a full explanation of:
 - bridge failures
 - snapshot policy
 - maintenance workflow
+- Sysmon telemetry deployment and event collection
 
 see:
 
 - [README_OPERATION.md](README_OPERATION.md)
+- [README_SYSMON.md](README_SYSMON.md)
 
 ---
 
@@ -212,3 +218,4 @@ Use the following documents for the rest:
 
 - VM setup: [README_VM.md](README_VM.md)
 - full operation guide: [README_OPERATION.md](README_OPERATION.md)
+- Sysmon telemetry guide: [README_SYSMON.md](README_SYSMON.md)
