@@ -237,8 +237,7 @@ def _member_behavior(member_result: dict | None, path: str = "archive") -> dict[
             "network + persistence behavior observed together",
             "critical"
         ))
-
-# Ransomware + 실행
+    # Ransomware + 실행
     if ransomware_hits > 0 and executed:
         score += 40
         reasons.append("Active ransomware execution")
@@ -259,7 +258,7 @@ def _member_behavior(member_result: dict | None, path: str = "archive") -> dict[
         "injection_signal": injection_hits > 0,
         "timed_out": timed_out,
         "nonzero_exit": returncode not in (None, 0, "0"),
-        "score": min(score, 55),
+        "score": min(score, 70),
         "reasons": reasons,
         "evidence_items": evidence_items,
     }
@@ -769,10 +768,6 @@ def calculate_score(scored_files: list[dict], dynamic_result: dict) -> dict[str,
         raw_score = max(raw_score, 85)
     if dynamic_result.get("persistence_signal") and dynamic_result.get("network_signal"):
         raw_score = max(raw_score, 75)
-    if dynamic_result.get("network_signal") and dynamic_result.get("persistence_signal"):
-        raw_score = max(raw_score, 75)
-    if dynamic_result.get("ransomware_signal"):
-        raw_score = max(raw_score, 80)
     strong_override = bool(dynamic_result.get("ransomware_signal")) or ((network_strength == 2) and dynamic_result.get("persistence_signal")) or malicious_count >= 2
     if strong_override:
         raw_score = max(raw_score, 72)
