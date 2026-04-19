@@ -19,22 +19,53 @@ from app.services.report_service import create_reanalysis_job
 
 
 
+_ARTIFACT_FILENAMES = {
+    'done.txt', 'events.jsonl', 'analysis_log.jsonl', 'network_trace.jsonl',
+    'report.json', 'report_final.json', 'stdout.txt', 'stderr.txt',
+}
+_ARTIFACT_DIR_MARKERS = {
+    'artifacts', 'artifact', 'analysis', 'logs', 'log', 'results', 'result',
+    'output', 'outputs', 'sandbox', 'trace', 'traces', 'evidence'
+}
+
+
+def _normalize_path(path: str) -> str:
+    return str(path or '').replace('/', '\\').strip('\\').lower()
+
+
 def _is_artifact_noise_path(path: str) -> bool:
-    lower = str(path or '').replace('/', '\\').lower()
+    lower = _normalize_path(path)
+    if not lower:
+        return False
     name = lower.rsplit('\\', 1)[-1]
-    return name.endswith('_stdout.txt') or name.endswith('_stderr.txt') or name in {'stdout.txt', 'stderr.txt'}
+    parts = [p for p in lower.split('\\') if p]
+    if name in _ARTIFACT_FILENAMES:
+        return True
+    if name.endswith('_stdout.txt') or name.endswith('_stderr.txt'):
+        return True
+    if name.startswith('report_') and name.endswith('.json'):
+        return True
+    if any(part in _ARTIFACT_DIR_MARKERS for part in parts[:-1]):
+        return True
+    return False
 
 
-def _is_extract_original_path(path: str) -> bool:
-    lower = str(path or '').replace('/', '\\').lower()
-    return lower.startswith('extract\\')
+def _is_display_noise_file(entry: dict) -> bool:
+    path = str(entry.get('file') or entry.get('path') or '')
+    lower = _normalize_path(path)
+    if _is_artifact_noise_path(lower):
+        return True
+    top_evidence = ' '.join(str(x) for x in _as_list(entry.get('top_evidence'))).lower()
+    if 'analysis artifact' in top_evidence or 'ignored analysis artifact' in top_evidence:
+        return True
+    return False
 
 
 def _display_drop_rows(rows: list[dict]) -> list[dict]:
     out = []
     for row in rows:
         path = str(row.get('path') or '')
-        if _is_artifact_noise_path(path) or _is_extract_original_path(path):
+        if _is_artifact_noise_path(path):
             continue
         out.append(row)
     return out
@@ -260,6 +291,76 @@ def _render_kv_table(data: dict, title_left: str = "Key", title_right: str = "Va
     return f"<table><thead><tr><th>{_e(title_left)}</th><th>{_e(title_right)}</th></tr></thead><tbody>{rows}</tbody></table>"
 
 
+def _report_basis_line(score: int, verdict: str, exec_count: int, files: list[dict], evidence_list: list[dict]) -> str:
+    real_files = [f for f in files if not _is_display_noise_file(f)]
+    top = real_files[0] if real_files else {}
+    top_name = str(top.get('file') or '-')
+    top_score = int(top.get('final_score', top.get('score', 0)) or 0)
+    signals = []
+    for ev in sorted(evidence_list, key=lambda x: int(x.get('weight', 0) or 0), reverse=True):
+        source = str(ev.get('source') or '')
+        if source and _is_artifact_noise_path(source):
+            continue
+        detail = str(ev.get('detail') or ev.get('signal') or '').strip()
+        if detail and detail not in signals:
+            signals.append(detail)
+        if len(signals) >= 3:
+            break
+    signal_text = '; '.join(signals) if signals else 'No strong signals recorded.'
+    if real_files:
+        return f"Verdict {verdict.upper()} ({score}/100). Primary basis: {top_name} scored {top_score}. Executed members: {exec_count}. Key signals: {signal_text}"
+    return f"Verdict {verdict.upper()} ({score}/100). Executed members: {exec_count}. Key signals: {signal_text}"
+
+
+def _display_reason_list(evidence_reasons: list[str], evidence_list: list[dict]) -> list[str]:
+    seen = set()
+    out = []
+    for value in evidence_reasons:
+        label = str(value).strip()
+        if not label:
+            continue
+        low = label.lower()
+        if 'text-like file cap' in low or 'text evidence cap' in low or 'test artifact cap' in low:
+            continue
+        if label not in seen:
+            seen.add(label)
+            out.append(label[:1].upper() + label[1:])
+        if len(out) >= 8:
+            return out
+    for ev in sorted(evidence_list, key=lambda x: int(x.get('weight', 0) or 0), reverse=True):
+        source = str(ev.get('source') or '')
+        if source and _is_artifact_noise_path(source):
+            continue
+        detail = str(ev.get('detail') or ev.get('signal') or '').strip()
+        if not detail:
+            continue
+        normalized = detail[:1].upper() + detail[1:]
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _filter_display_files(files: list[dict]) -> list[dict]:
+    return [f for f in files if not _is_display_noise_file(f)]
+
+
+def _filter_display_evidence(evidence_list: list[dict]) -> list[dict]:
+    out = []
+    for entry in evidence_list:
+        source = str(entry.get('source') or '')
+        detail = str(entry.get('detail') or '')
+        if source and _is_artifact_noise_path(source):
+            continue
+        if 'analysis artifact' in detail.lower() or 'text-like file cap' in detail.lower() or 'test artifact cap' in detail.lower():
+            continue
+        out.append(entry)
+    return out
+
+
 @router.get("/{report_id}/view", response_class=HTMLResponse)
 def report_view(report_id: str, token: str | None = Query(default=None)):
     if not _artifact_access_allowed(token):
@@ -280,9 +381,11 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     iocs = _as_dict(item.get("iocs"))
     failure_detail = _as_dict(item.get("failure_detail"))
     files = _as_list(static_result.get("files"))
+    display_files = _filter_display_files(files)
     static_summary = _as_dict(static_result.get("summary"))
     evidence_reasons = [str(x) for x in _as_list(item.get("evidence_reasons")) if str(x).strip()]
     evidence_list = _as_list(item.get("evidence_list"))
+    display_evidence_list = _filter_display_evidence(evidence_list)
     normalized_iocs = _as_dict(item.get("normalized_iocs") or evidence_bundle.get("normalized_iocs"))
     artifact_manifest = _as_dict(item.get("artifact_manifest") or evidence_bundle.get("artifact_manifest"))
     archive_profile = _as_dict(item.get("archive_profile"))
@@ -290,7 +393,7 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     score_breakdown = _as_dict(item.get("score_breakdown"))
     sample_hashes = _as_dict(item.get("sample_hashes"))
 
-    file_count = int(static_summary.get("file_count", 0) or 0)
+    file_count = int(len(display_files) or static_summary.get("file_count", 0) or 0)
     malware_types = _as_list(item.get("malware_type_tags") or iocs.get("malware_types") or [])
     yara_matches = _as_list(iocs.get("yara_matches", []))
     exec_count = int(dynamic_result.get("archive_member_exec_count", 0) or 0)
@@ -302,32 +405,12 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     memory_dumps = _as_list(evidence_bundle.get("memory_dumps") or dynamic_result.get("memory_dumps"))
     timeline = _as_list(dynamic_result.get("timeline"))
 
-    failed_count = sum(1 for f in files if f.get("fail_reason") and f.get("fail_reason") not in {"not_executable", "document_execution_not_supported", "not_selected_for_execution"})
+    failed_count = sum(1 for f in display_files if f.get("fail_reason") and f.get("fail_reason") not in {"not_executable", "document_execution_not_supported", "not_selected_for_execution"})
 
-    def _dedupe_reason_list(values: list[str]) -> list[str]:
-        counts: dict[str, int] = {}
-        for raw in values:
-            label = str(raw).strip()
-            if not label:
-                continue
-            if label.startswith("YARA match"):
-                key = "YARA matches"
-            elif label.startswith("suspicious keywords"):
-                key = "Suspicious keywords"
-            elif label.startswith("downloader strings"):
-                key = "Downloader strings"
-            else:
-                key = label[:1].upper() + label[1:]
-            counts[key] = counts.get(key, 0) + 1
-        out = []
-        for key, count in counts.items():
-            out.append(f"{key} ({count})" if count > 1 and not key.endswith('s') else key)
-        return out[:8]
-
-    summary_reasons = _dedupe_reason_list(evidence_reasons)
+    summary_reasons = _display_reason_list(evidence_reasons, display_evidence_list)
     summary_reasons_html = "".join(f"<li>{_e(x)}</li>" for x in summary_reasons) or "<li>No major reasons recorded.</li>"
 
-    files_sorted = sorted(files, key=lambda x: int(x.get("final_score", x.get("score", 0)) or 0), reverse=True)
+    files_sorted = sorted(display_files, key=lambda x: int(x.get("final_score", x.get("score", 0)) or 0), reverse=True)
     top_files = files_sorted[:10]
     top_file_rows = ""
     for entry in top_files:
@@ -353,10 +436,10 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
             f"<td>{_e(yara)}</td>"
             f"<td>{_e(evidence)}</td></tr>"
         )
-    top_file_rows = top_file_rows or "<tr><td colspan='8' class='muted'>No files analyzed.</td></tr>"
+    top_file_rows = top_file_rows or "<tr><td colspan='8' class='muted'>No sample files analyzed.</td></tr>"
 
     evidence_link_map = {str(x.get("signal") or ""): _as_list(x.get("links")) for x in _as_list(artifact_manifest.get("evidence_links"))}
-    evidence_sorted = sorted(evidence_list, key=lambda x: int(x.get("weight", 0) or 0), reverse=True)[:12]
+    evidence_sorted = sorted(display_evidence_list, key=lambda x: int(x.get("weight", 0) or 0), reverse=True)[:12]
     evidence_rows = ""
     for entry in evidence_sorted:
         links = evidence_link_map.get(str(entry.get("signal") or ""), [])[:2]
@@ -401,7 +484,9 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     network_rows = "".join(
         f"<tr><td>{_e(x.get('pid', '-'))}</td><td>{_e(x.get('remote_ip', '-'))}</td><td>{_e(x.get('remote_port', '-'))}</td><td>{_e(x.get('status', '-'))}</td></tr>" for x in network_endpoints[:20]
     ) or "<tr><td colspan='4' class='muted'>No network endpoints recorded.</td></tr>"
-    if any(int(x.get('pid', 0) or 0) == 0 for x in network_endpoints):
+    if exec_count == 0 and network_endpoints:
+        network_rows += "<tr><td colspan='4' class='muted'>Note: no archive member executed. These connections may reflect background VM traffic rather than sample behavior.</td></tr>"
+    elif any(int(x.get('pid', 0) or 0) == 0 for x in network_endpoints):
         network_rows += "<tr><td colspan='4' class='muted'>Note: PID 0 or unowned connections are weak signals and may reflect background VM traffic.</td></tr>"
     timeline_rows = "".join(
         f"<tr><td>{_e(x.get('ts', '-'))}</td><td>{_e(x.get('stage', '-'))}</td><td>{_e(json.dumps({k: v for k, v in x.items() if k not in {'ts', 'stage'}}, ensure_ascii=False))}</td></tr>" for x in timeline[:20]
@@ -422,11 +507,11 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     hash_html = "".join(f"<div><strong>{_e(k.upper())}</strong><br><code>{_e(v)}</code></div>" for k, v in sample_hashes.items()) or "<span class='muted'>No hashes recorded.</span>"
     malware_type_html = "".join(f"<span class='chip'>{_e(v)}</span>" for v in malware_types[:8]) or "<span class='muted'>Unclassified</span>"
     advanced_metrics = [
-        ("Top file", score_breakdown.get("top_file", 0)),
+        ("Primary file score", score_breakdown.get("top_file", score_breakdown.get("max_score", 0))),
         ("Top 3 avg", score_breakdown.get("top3_average", 0)),
-        ("Runtime bonus", score_breakdown.get("archive_runtime", 0)),
+        ("Dynamic bonus", score_breakdown.get("archive_runtime", score_breakdown.get("dynamic_bonus", 0))),
         ("Distribution", score_breakdown.get("distribution", 0)),
-        ("Benign penalty", score_breakdown.get("benign_penalty", 0)),
+        ("Penalty", score_breakdown.get("benign_penalty", 0)),
         ("Memory dumps", len(memory_dumps)),
         ("Skipped exec", skipped_count),
         ("YARA hits", len(yara_matches)),
@@ -456,6 +541,7 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
           <span class='badge low'>STATUS: {_e(str(status).upper())}</span>
         </div>
         <p style='margin:14px 0 0;line-height:1.65'>{_e(item.get('summary', ''))}</p>
+        <p style='margin:10px 0 0;line-height:1.65;color:var(--muted)'>{_e(_report_basis_line(score, verdict, exec_count, files_sorted, evidence_sorted))}</p>
         <div class='toolbar'>
           <a class='btn' href='/api/reports/{_e(report_id)}' target='_blank' rel='noopener noreferrer'>Open JSON</a>
           <a class='btn' href='/api/reports/{_e(report_id)}/download'>Download JSON</a>
@@ -500,6 +586,7 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     <section class='grid'>
       <div class='card'>
         <h2>Behavior summary</h2>
+        <p class='section-intro'>분석 산출물과 로그 파일은 숨기고 실제 샘플 파일만 표시합니다.</p>
         <table><thead><tr><th>File</th><th>Score</th><th>Severity</th><th>Exec</th><th>Attempt</th><th>Type tags</th><th>YARA</th><th>Top evidence</th></tr></thead><tbody>{top_file_rows}</tbody></table>
       </div>
       <div class='card'>

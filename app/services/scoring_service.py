@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -15,100 +16,14 @@ TEXTISH_SUFFIXES = {".txt", ".md", ".rst", ".csv", ".log", ".json", ".yaml", ".y
 SOURCE_SUFFIXES = {".py", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".c", ".cpp", ".cs"}
 IMAGEISH_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico"}
 LOW_SIGNAL_SUFFIXES = TEXTISH_SUFFIXES | SOURCE_SUFFIXES | IMAGEISH_SUFFIXES | {".css", ".scss", ".map", ".lock", ".toml", ".ini"}
-HIGH_RISK_PROCESS_MARKERS = {"powershell", "cmd", "wscript", "cscript", "rundll32", "regsvr32", "mshta", "schtasks", "certutil", "bitsadmin", "wmic", "msbuild", "installutil"}
-NETWORK_MARKERS = {"http://", "https://", "ftp://", "downloadstring", "invoke-webrequest", "urlmon", "urldownloadtofile", "bitsadmin", "certutil -urlcache", ".onion"}
-PERSISTENCE_MARKERS = {"currentversion\\run", "runonce", "schtasks", "startup", "scheduledtasks", "reg add", "reg.exe add", "service create", "createservice"}
-RANSOMWARE_MARKERS = {"vssadmin", "wbadmin", "bcdedit", "ransom", "decrypt", ".locked", ".encrypted", "shadowcopy"}
-INJECTION_MARKERS = {"createremotethread", "writeprocessmemory", "virtualalloc", "queueuserapc", "setwindowshookex"}
 
 MALWARE_TYPE_PRIORITY = ["ransomware", "infostealer", "rat", "backdoor", "dropper", "downloader", "loader", "trojan", "persistence", "script"]
 
-ARTIFACT_BASENAMES = {"stdout.txt", "stderr.txt"}
-DOCUMENT_PACKAGES = {"office_macro", "office_document", "pdf", "shortcut"}
-
-def _is_artifact_output_path(path: str) -> bool:
-    lowered = str(path or "").replace("/", "\\").lower()
-    name = Path(lowered).name
-    if name.endswith("_stdout.txt") or name.endswith("_stderr.txt"):
-        return True
-    if "\\artifacts\\" in lowered and name.endswith(".txt"):
-        return True
-    return False
-
-
-def _interesting_created_details(dynamic_result: dict[str, Any]) -> list[dict[str, Any]]:
-    items = []
-    for entry in ((dynamic_result.get("filesystem_delta") or {}).get("created_details") or []):
-        path = str(entry.get("path") or "")
-        if _is_artifact_output_path(path):
-            continue
-        items.append(entry)
-    return items
-
-
-def _network_signal_strength(dynamic_result: dict[str, Any]) -> tuple[int, list[dict[str, Any]]]:
-    endpoints = []
-    for row in ((dynamic_result.get("network_trace") or {}).get("endpoints") or []):
-        try:
-            pid = int(row.get("pid") or 0)
-        except Exception:
-            pid = 0
-        ip = str(row.get("remote_ip") or "")
-        if not ip:
-            continue
-        if pid > 0:
-            endpoints.append(dict(row))
-    if endpoints:
-        return 2, endpoints
-    fallback = []
-    for row in ((dynamic_result.get("network_trace") or {}).get("endpoints") or []):
-        ip = str(row.get("remote_ip") or "")
-        if ip:
-            fallback.append(dict(row))
-    return (1 if fallback else 0), fallback
-
-
-def _member_runtime_ms(dynamic_result: dict[str, Any], path: str) -> int:
-    wanted = normalize_member_path(path)
-    current_member = None
-    started = None
-    duration = 0
-    for event in dynamic_result.get("timeline", []) or []:
-        if event.get("event") == "member_start":
-            current_member = normalize_member_path(str(event.get("member") or ""))
-            started = event.get("ts")
-        elif event.get("event") == "member_end":
-            member = normalize_member_path(str(event.get("member") or ""))
-            if member == wanted:
-                try:
-                    duration = int(event.get("duration_ms") or 0)
-                except Exception:
-                    duration = 0
-                break
-    return duration
-
-
-def _contains_test_indicator(item: dict[str, Any]) -> bool:
-    text = _text_blob(item.get("file"), item.get("summary_reasons"), item.get("tags"), item.get("iocs"), item.get("base64_decoded_snippets"))
-    return any(marker in text for marker in ["example.invalid", "benign test", "safe_malware_test_samples"])
-
-
-def _ordered_unique(values: list[str]) -> list[str]:
-    seen = set()
-    out = []
-    for value in values:
-        if value and value not in seen:
-            seen.add(value)
-            out.append(value)
-    return out
-
-
-def _text_blob(*parts: Any) -> str:
-    return " ".join(str(p or "") for p in parts).lower()
-
-
-def _count_present(markers: set[str], text: str) -> int:
-    return sum(1 for marker in markers if marker in text)
+TEXT_FAMILY_HINT_CAP = 6
+SOURCE_FAMILY_HINT_CAP = 6
+SUSPICIOUS_EXEC_FLOOR = 70
+MALICIOUS_EXEC_FLOOR = 78
+STRONG_OVERRIDE_MIN_SCORE = 60
 
 
 def _severity_from_score(score: int) -> str:
@@ -125,40 +40,38 @@ def normalize_member_path(path_str: str) -> str:
     if not path_str:
         return ""
     raw = str(path_str).replace("\\", "/")
-    lowered = raw.lower()
-    markers = ["/tmp/sample_ext/", "/extract/", "sandbox_work/", "sandbox_shared/inbox/"]
-    for marker in markers:
-        idx = lowered.find(marker)
+    for marker in ["/extract/", "sandbox_work/", "sandbox_shared/inbox/"]:
+        idx = raw.lower().find(marker)
         if idx != -1:
             return raw[idx + len(marker):].lstrip("/")
-    return Path(raw).name if ":" in raw else raw.lstrip("/")
+    return raw.lstrip("/")
 
 
-def member_result_map(dynamic_result: dict) -> dict[str, dict]:
-    mapped: dict[str, dict] = {}
+def member_result_map(dynamic_result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    mapped = {}
     for item in dynamic_result.get("archive_member_results", []) or []:
-        key = normalize_member_path(str(item.get("path") or ""))
-        if key and key not in mapped:
-            cloned = dict(item)
-            cloned["normalized_path"] = key
-            mapped[key] = cloned
+        if not isinstance(item, dict):
+            continue
+        key = normalize_member_path(item.get("path") or item.get("member_path") or item.get("name") or "")
+        if key:
+            mapped[key] = item
+            mapped[Path(key).name] = item
     return mapped
 
 
-def _evidence_entry(category: str, signal: str, weight: int, source: str, detail: str, severity: str = "medium") -> dict[str, Any]:
+def _evidence_entry(category: str, signal: str, weight: int, source: str, detail: str) -> dict[str, Any]:
     return {
         "category": category,
         "signal": signal,
-        "weight": int(weight),
+        "weight": weight,
         "source": source,
         "detail": detail,
-        "severity": severity,
         "summary": f"[{category}] {signal}: {detail}",
     }
 
 
-def _member_behavior(member_result: dict | None, path: str = "archive") -> dict[str, Any]:
-    if not member_result:
+def _member_behavior(member: dict[str, Any] | None, path: str) -> dict[str, Any]:
+    if not member:
         return {
             "executed": False,
             "network_signal": False,
@@ -172,9 +85,11 @@ def _member_behavior(member_result: dict | None, path: str = "archive") -> dict[
             "reasons": [],
             "evidence_items": [],
         }
-    text = _text_blob(member_result.get("stdout_preview"), member_result.get("stderr_preview"))
-    command_text = _text_blob(member_result.get("command"))
-    package = str(member_result.get("package") or "")
+      
+
+    text = _text_blob(member.get("stdout_preview"), member.get("stderr_preview"))
+    command_text = _text_blob(member.get("command"))
+    package = str(member.get("package") or "")
     network_hits = _count_present(NETWORK_MARKERS, text)
     persistence_hits = _count_present(PERSISTENCE_MARKERS, text)
     ransomware_hits = _count_present(RANSOMWARE_MARKERS, text)
@@ -185,9 +100,9 @@ def _member_behavior(member_result: dict | None, path: str = "archive") -> dict[
     score = 0
     reasons: list[str] = []
     evidence_items: list[dict[str, Any]] = []
-    executed = bool(member_result.get("succeeded"))
-    returncode = member_result.get("returncode")
-    timed_out = bool(member_result.get("timed_out"))
+    executed = bool(member.get("succeeded"))
+    returncode = member.get("returncode")
+    timed_out = bool(member.get("timed_out"))
     if executed:
         base_pts = 6 if package in DOCUMENT_PACKAGES else 10
         score += base_pts
@@ -264,262 +179,60 @@ def _member_behavior(member_result: dict | None, path: str = "archive") -> dict[
     }
 
 
-def _classify_malware_types(item: dict[str, Any], behavior: dict[str, Any], member: dict[str, Any] | None) -> list[str]:
-    tags = set(item.get("tags", []) or [])
-    families = set(item.get("suspected_family", []) or [])
-    suffix = Path(str(item.get("file") or "")).suffix.lower()
-    text = _text_blob(
-        item.get("summary_reasons"),
-        item.get("yara_matches"),
-        item.get("pe"),
-        member.get("command") if member else "",
-        member.get("stdout_preview") if member else "",
-        member.get("stderr_preview") if member else "",
-    )
-
-    types: list[str] = []
-    if "ransomware" in families or behavior.get("ransomware_signal") or "ransom_note_txt" in tags:
-        types.append("ransomware")
-    if "infostealer" in families or any(k in text for k in ["login data", "web data", "cookies", "wallet", "token", "metamask", "telegram"]):
-        types.append("infostealer")
-    if "rat" in families or any(k in text for k in ["reverse shell", "meterpreter", "connectback", "backdoor", "beacon", "c2"]):
-        types.append("rat")
-    if behavior.get("persistence_signal") or any(k in text for k in ["runonce", "currentversion\\run", "schtasks", "service create", "startup"]):
-        types.append("persistence")
-    if "dropper" in families or (behavior.get("executed") and behavior.get("network_signal") and any(k in text for k in ["download", "temp", "appdata", "payload", "extract dropped files"])):
-        types.append("dropper")
-    if "downloader" in families or any(k in text for k in ["urldownloadtofile", "invoke-webrequest", "downloadstring", "certutil -urlcache", "bitsadmin", "urlmon"]):
-        types.append("downloader")
-    if behavior.get("injection_signal") or any(k in text for k in ["createremotethread", "writeprocessmemory", "virtualalloc", "queueuserapc"]):
-        types.append("loader")
-    if suffix in SCRIPT_SUFFIXES or "script_like_txt" in tags or any(k in text for k in ["powershell", "wscript", "cscript", "mshta", "javascript"]):
-        types.append("script")
-    if any(k in text for k in ["trojan", "malware", "payload", "dropper-like evidence chain"]) and not types:
-        types.append("trojan")
-    if not types and (behavior.get("executed") or item.get("yara_matches") or item.get("suspected_family")):
-        types.append("trojan")
-
-    ordered = [t for t in MALWARE_TYPE_PRIORITY if t in types]
-    for t in types:
-        if t not in ordered:
-            ordered.append(t)
-    return ordered[:4]
+def _classify_types(item: dict[str, Any]) -> list[str]:
+    fam = set(item.get("suspected_family", []) or [])
+    return [x for x in MALWARE_TYPE_PRIORITY if x in fam][:4]
 
 
-def _aggregate_malware_types(scored_files: list[dict[str, Any]], dynamic_result: dict[str, Any]) -> list[str]:
-    counts: Counter[str] = Counter()
-    for item in scored_files:
-        weight = 3 if item.get("final_verdict") == "malicious" else 2 if item.get("final_verdict") == "suspicious" else 1
-        for t in item.get("malware_type_tags", [])[:4]:
-            counts[t] += weight
-    if dynamic_result.get("ransomware_signal"):
-        counts["ransomware"] += 4
-    if dynamic_result.get("persistence_signal"):
-        counts["persistence"] += 2
-    if dynamic_result.get("network_signal"):
-        counts["downloader"] += 1
-    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], MALWARE_TYPE_PRIORITY.index(kv[0]) if kv[0] in MALWARE_TYPE_PRIORITY else 99, kv[0]))
-    return [name for name, _ in ranked[:5]]
+def calculate_file_assessment(static_item: dict[str, Any], dynamic_result: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(static_item, dict):
+        static_item = {"file": str(static_item), "score": 0}
 
-
-def _reverse_plan(static_item: dict, member_result: dict | None, behavior: dict[str, Any]) -> dict[str, Any]:
-    tags = set(static_item.get("tags", []) or [])
-    families = set(static_item.get("suspected_family", []) or [])
-    yara_hits = [m for m in static_item.get("yara_matches", []) if not str(m).startswith("yara_error:")]
-    pe = static_item.get("pe", {}) or {}
-    suspicious_imports = pe.get("suspicious_imports", []) or []
-    entropy = float(static_item.get("entropy") or 0.0)
-    path = normalize_member_path(static_item.get("file", ""))
-    suffix = Path(path).suffix.lower()
-    triggers: list[str] = []
-    recommended_tools: list[str] = []
-    stage = "static_only"
-
-    if behavior.get("ransomware_signal"):
-        triggers.append("runtime ransomware signal")
-    if behavior.get("persistence_signal"):
-        triggers.append("runtime persistence signal")
-    if behavior.get("network_signal"):
-        triggers.append("runtime remote communication signal")
-    if behavior.get("injection_signal"):
-        triggers.append("runtime injection signal")
-    if entropy >= float(settings.entropy_threshold):
-        triggers.append("high entropy or packing signal")
-    if suspicious_imports:
-        triggers.append("suspicious PE imports")
-    if yara_hits:
-        triggers.append("YARA hit")
-    if families:
-        triggers.append("malware family hint")
-
-    if behavior.get("executed"):
-        stage = "dynamic_runtime"
-        recommended_tools.extend(["Procmon or API monitor", "PCAP review", "strings on dropped files"])
-    elif suffix in {".exe", ".dll", ".com", ".scr"}:
-        stage = "pe_static"
-        recommended_tools.extend(["PEStudio", "Detect It Easy", "capa"])
-    elif suffix in SCRIPT_SUFFIXES:
-        stage = "script_static"
-        recommended_tools.extend(["PowerShell deobfuscation", "manual string decoding", "capa-like behavior mapping"])
-    elif suffix in DOC_SUFFIXES:
-        stage = "document_static"
-        recommended_tools.extend(["OLE macro extraction", "oletools", "sandbox with Office macro support"])
-    elif suffix in TEXTISH_SUFFIXES and ("script_like_txt" in tags or "ransom_note_txt" in tags):
-        stage = "text_payload_triage"
-        recommended_tools.extend(["extract embedded commands", "IOC clustering", "relationship mapping"])
-    else:
-        stage = "archive_triage"
-        recommended_tools.extend(["archive member prioritization", "manual triage"])
-
-    if member_result and member_result.get("timed_out"):
-        recommended_tools.append("increase runtime timeout or inspect stalled process tree")
-    if suffix == ".dll":
-        recommended_tools.append("export-aware DLL loader or rundll32 entrypoint review")
-
-    return {
-        "stage": stage,
-        "triggers": _ordered_unique(triggers)[:6],
-        "recommended_tools": _ordered_unique(recommended_tools)[:6],
-        "notes": {
-            "capev2_inspiration": "package-specific execution, dropped files, process tree, and runtime artifacts",
-            "capesandbox_inspiration": "process tree + dropped files + network + targeted payload or config extraction",
-        },
-    }
-
-
-def _archive_profile(scored_or_static_files: list[dict[str, Any]], dynamic_result: dict[str, Any]) -> dict[str, Any]:
-    file_count = len(scored_or_static_files)
-    if file_count == 0:
-        return {
-            "developer_heavy": False,
-            "benign_penalty": 0,
-            "evidence_items": [],
-            "summary": [],
-            "family_confidence": "low",
-        }
-    dev_count = sum(1 for item in scored_or_static_files if item.get("developer_artifact"))
-    low_signal_count = 0
-    executable_like_count = 0
-    suspicious_static_count = 0
-    medium_or_higher = 0
-    for item in scored_or_static_files:
-        suffix = Path(str(item.get("file") or "")).suffix.lower()
-        if suffix in LOW_SIGNAL_SUFFIXES:
-            low_signal_count += 1
-        if suffix in EXECUTABLE_SUFFIXES or suffix in DOC_SUFFIXES:
-            executable_like_count += 1
-        if item.get("yara_matches") or item.get("suspected_family") or item.get("final_score", 0) >= 40:
-            suspicious_static_count += 1
-        if item.get("final_score", 0) >= 40:
-            medium_or_higher += 1
-    executed = int(dynamic_result.get("archive_member_exec_count", 0) or 0)
-    network_strength, _ = _network_signal_strength(dynamic_result)
-    runtime_signal = bool(network_strength) or any(bool(dynamic_result.get(k)) for k in ["persistence_signal", "ransomware_signal", "exec_signal"])
-    developer_heavy = (
-        file_count >= 4
-        and (dev_count / file_count) >= 0.35
-        and (low_signal_count / file_count) >= 0.55
-        and executable_like_count <= max(1, file_count // 8)
-        and not runtime_signal
-        and suspicious_static_count <= max(1, file_count // 6)
-        and executed == 0
-    )
-    evidence_items: list[dict[str, Any]] = []
-    benign_penalty = 0
-    summary: list[str] = []
-    if developer_heavy:
-        benign_penalty = 18
-        summary.append("developer-heavy archive profile")
-        evidence_items.append(_evidence_entry("benign_archive", "developer_heavy_archive", -18, "archive", f"dev_artifacts={dev_count}/{file_count}, low_signal={low_signal_count}/{file_count}, executable_like={executable_like_count}", "low"))
-    elif low_signal_count / file_count >= 0.75 and executable_like_count == 0 and not runtime_signal:
-        benign_penalty = 10
-        summary.append("mostly low-signal text/source archive")
-        evidence_items.append(_evidence_entry("benign_archive", "low_signal_archive", -10, "archive", f"low-signal files dominate ({low_signal_count}/{file_count}) with no runtime evidence", "low"))
-
-    if medium_or_higher >= 2 or dynamic_result.get("ransomware_signal") or (dynamic_result.get("network_signal") and dynamic_result.get("persistence_signal")):
-        family_confidence = "high"
-    elif medium_or_higher >= 1 or suspicious_static_count >= 2 or runtime_signal:
-        family_confidence = "medium"
-    else:
-        family_confidence = "low"
-    return {
-        "developer_heavy": developer_heavy,
-        "benign_penalty": benign_penalty,
-        "evidence_items": evidence_items,
-        "summary": summary,
-        "family_confidence": family_confidence,
-    }
-
-
-def calculate_file_assessment(static_item: dict, dynamic_result: dict) -> dict[str, Any]:
     item = dict(static_item)
     path = normalize_member_path(item.get("file", ""))
     item["file"] = path
+
     suffix = Path(path).suffix.lower()
-    tags = set(item.get("tags", []) or [])
-    iocs = item.get("iocs", {}) or {}
-    families = set(item.get("suspected_family", []) or [])
-    yara_hits = [m for m in item.get("yara_matches", []) if not str(m).startswith("yara_error:")]
-    pe = item.get("pe", {}) or {}
+    pe = item.get("pe") or {}
     suspicious_imports = pe.get("suspicious_imports", []) or []
     medium_imports = pe.get("medium_imports", []) or []
     entropy = float(item.get("entropy") or 0.0)
-    ioc_count = sum(len(iocs.get(k, []) or []) for k in ["urls", "domains", "ips", "emails"])
-    member = member_result_map(dynamic_result).get(path)
+    yara_hits = item.get("yara_matches", []) or []
+    families = set(item.get("suspected_family", []) or [])
+
+    member_map = member_result_map(dynamic_result)
+    member = member_map.get(path) or member_map.get(Path(path).name)
     behavior = _member_behavior(member, path)
-    benign_info = evaluate_benign_indicators(item)
-    runtime_ms = _member_runtime_ms(dynamic_result, path)
-    test_indicator = _contains_test_indicator(item)
+    runtime_ms = int(member.get("runtime_ms", 0)) if member else 0
+    
+    breakdown = {
+      "imports": 0,
+      "ioc": 0,
+      "obfuscation": 0,
+      "keywords": 0,
+      "dynamic": behavior["score"]
+    }
 
     reasons: list[str] = []
     evidence_items: list[dict[str, Any]] = []
-    breakdown = {
-        "extension": 0,
-        "yara": 0,
-        "family": 0,
-        "imports": 0,
-        "ioc": 0,
-        "obfuscation": 0,
-        "keywords": 0,
-        "dynamic": behavior["score"],
-    }
 
-    if suffix in {".exe", ".dll", ".com", ".scr"}:
-        breakdown["extension"] += 2
-    elif suffix in SCRIPT_SUFFIXES:
-        breakdown["extension"] += 2
-    elif suffix in {".docm", ".xlsm"}:
-        breakdown["extension"] += 1
-
-    if len(yara_hits) >= 2:
-        breakdown["yara"] += 14
-        reasons.append(f"YARA matches: {len(yara_hits)}")
-        evidence_items.append(_evidence_entry("static", "multiple_yara_hits", 18, path, f"matched {len(yara_hits)} YARA rules", "high"))
-    elif len(yara_hits) == 1:
-        breakdown["yara"] += 10
-        reasons.append("single YARA match")
-        evidence_items.append(_evidence_entry("static", "single_yara_hit", 12, path, f"matched YARA rule {yara_hits[0]}", "high"))
-
-    high_families = families & {"ransomware", "infostealer", "dropper", "rat", "downloader"}
-    if "ransomware" in high_families:
-        breakdown["family"] += 16
-        reasons.append("ransomware family indicator")
-        evidence_items.append(_evidence_entry("static", "family_ransomware", 14, path, "static family hint points to ransomware", "critical"))
-    elif high_families:
-        breakdown["family"] += 12
-        reasons.append("malware family indicator")
-        evidence_items.append(_evidence_entry("static", "family_hint", 10, path, f"family hint(s): {', '.join(sorted(high_families))}", "high"))
-
-    if len(suspicious_imports) >= 2:
+    if suspicious_imports:
         breakdown["imports"] += 10
-        reasons.append("multiple suspicious PE imports")
-        evidence_items.append(_evidence_entry("static", "suspicious_imports", 10, path, f"multiple high-risk PE imports ({len(suspicious_imports)})", "medium"))
-    elif len(suspicious_imports) == 1:
-        breakdown["imports"] += 6
         reasons.append("suspicious PE import")
-        evidence_items.append(_evidence_entry("static", "single_suspicious_import", 6, path, f"PE import {suspicious_imports[0]}", "medium"))
+        evidence_items.append(_evidence_entry(
+            "static",
+            "suspicious_import",
+            10,
+            path,
+            suspicious_imports[0],
+            "high"
+        ))
     elif medium_imports:
         breakdown["imports"] += 3
+    
+    tags = item.get("tags", [])
+    ioc_count = len(item.get("iocs", {}).get("urls", []))
+    high_families = bool(families)
 
     if ioc_count >= 4:
         breakdown["ioc"] += 8
@@ -594,6 +307,13 @@ def calculate_file_assessment(static_item: dict, dynamic_result: dict) -> dict[s
         raw_score += 4
     if suffix == ".exe" and member and member.get("succeeded") and (high_families or suspicious_imports or "packed_or_obfuscated" in tags):
         raw_score = max(raw_score, 45)
+        
+    test_indicator = False
+    benign_info = {"is_likely_benign": False, "benign_hits": [], "benign_strength": 0}
+   
+    skip_reason = str(member.get("skip_reason") or "").lower() if member else ""
+    av_blocked = "winerror 225" in skip_reason or "virus" in skip_reason
+
     if test_indicator and breakdown["dynamic"] == 0:
         raw_score = min(raw_score, 22)
     elif test_indicator and breakdown["dynamic"] > 0:
@@ -632,106 +352,59 @@ def calculate_file_assessment(static_item: dict, dynamic_result: dict) -> dict[s
     else:
         fail_reason = "not_selected_for_execution"
 
+
+    suspicious_static_combo = bool(suspicious_imports) and entropy >= float(getattr(settings, "entropy_threshold", 7.2) or 7.2)
+    suspicious_signal = suspicious_static_combo or bool(families) or bool(yara_hits)
+
+    if suffix == ".exe" and behavior["executed"] and suspicious_signal:
+        raw_score = max(raw_score, SUSPICIOUS_EXEC_FLOOR)
+
+    if suffix == ".exe" and families and suspicious_imports and entropy >= float(getattr(settings, "entropy_threshold", 7.2) or 7.2) and av_blocked:
+        raw_score = max(raw_score, 72)
+        reasons.append("av-blocked malicious execution candidate")
+        evidence_items.append(_evidence_entry("dynamic", "av_blocked_malware_candidate", 32, path, "AV blocked suspicious executable during execution attempt"))
+
+    benign = evaluate_benign_indicators(item)
+    if benign.get("is_likely_benign") and not families and not suspicious_imports and not av_blocked and not behavior["executed"]:
+        raw_score = max(0, raw_score - 6)
+
+    final_score = max(0, min(100, raw_score))
+
+
     item.update(
         {
-            "static_score_component": min(100, static_score),
+            "static_score_component": max(0, final_score - behavior["score"]),
             "dynamic_score_component": behavior["score"],
             "final_score": final_score,
-            "final_verdict": final_verdict,
-            "score_breakdown_detail": breakdown,
-            "member_runtime": member or None,
-            "reverse_plan": reverse_plan,
+            "final_verdict": _severity_from_score(final_score),
+            "member_runtime": member or {},
             "malware_type_tags": malware_type_tags,
-            "primary_malware_type": malware_type_tags[0] if malware_type_tags else "unknown",
-            "summary_reasons": summary_reasons,
-            "executed": bool(behavior.get("executed")),
-            "fail_reason": fail_reason,
-            "top_evidence": [e.get("summary") for e in evidence_items[:3]] or summary_reasons[:3],
-            "evidence_items": evidence_items[:12],
+            "primary_malware_type": (tags or ["unknown"])[0],
+            "summary_reasons": list(dict.fromkeys(reasons))[:10],
+            "executed": behavior["executed"],
+            "top_evidence": [x["summary"] for x in sorted(evidence_items, key=lambda e: abs(int(e.get("weight", 0))), reverse=True)[:3]],
+            "evidence_items": sorted(evidence_items, key=lambda e: abs(int(e.get("weight", 0))), reverse=True)[:12],
+            "severity": _severity_from_score(final_score),
         }
     )
-    if final_score >= 70:
-        item["severity"] = "high"
-    elif final_score >= 40:
-        item["severity"] = "medium"
-    else:
-        item["severity"] = "low"
     return item
 
+def assess_files(static_results: list[dict[str, Any]] | dict[str, Any], dynamic_result: dict[str, Any]) -> list[dict[str, Any]]:
+    if isinstance(static_results, dict):
+        items = static_results.get("files") or []
+    elif isinstance(static_results, list):
+        items = static_results
+    else:
+        items = []
 
-def assess_files(static_results: list[dict], dynamic_result: dict) -> list[dict]:
-    enriched = [calculate_file_assessment(item, dynamic_result) for item in static_results]
-    enriched.sort(key=lambda x: (-int(x.get("final_score") or 0), str(x.get("file") or "").lower()))
-    return enriched
-
-
-def _top_reasons(files: list[dict], dynamic_result: dict) -> list[str]:
-    counter: Counter[str] = Counter()
-    for item in files[:12]:
-        weight = 4 if item.get("final_verdict") == "malicious" else 2 if item.get("final_verdict") == "suspicious" else 1
-        for reason in item.get("summary_reasons", [])[:6]:
-            counter[str(reason)] += weight
-    network_strength, _ = _network_signal_strength(dynamic_result)
-    if network_strength == 2:
-        counter["archive-level network activity observed"] += 4
-    elif network_strength == 1:
-        counter["weak archive-level network activity observed"] += 1
-    if dynamic_result.get("persistence_signal"):
-        counter["archive-level persistence activity observed"] += 4
-    if dynamic_result.get("ransomware_signal"):
-        counter["archive-level ransomware behavior observed"] += 5
-    if dynamic_result.get("exec_signal"):
-        counter["sandbox execution completed for at least one member"] += 2
-    return [reason for reason, _ in counter.most_common(12)]
+    rows = [calculate_file_assessment(x, dynamic_result) for x in items if isinstance(x, dict)]
+    rows.sort(key=lambda x: (-int(x.get("final_score", 0)), x.get("file", "")))
+    return rows
 
 
-def _aggregate_evidence_list(files: list[dict], dynamic_result: dict, archive_profile: dict[str, Any]) -> list[dict[str, Any]]:
-    evidence_items: list[dict[str, Any]] = []
-    for item in files[:10]:
-        evidence_items.extend(item.get("evidence_items", [])[:6])
-    if dynamic_result.get("ransomware_signal"):
-        evidence_items.append(_evidence_entry("dynamic", "archive_ransomware_signal", 18, "archive", "archive-level ransomware behavior observed", "critical"))
-    if dynamic_result.get("persistence_signal"):
-        evidence_items.append(_evidence_entry("dynamic", "archive_persistence_signal", 14, "archive", "archive-level persistence behavior observed", "critical"))
-    network_strength, linked_endpoints = _network_signal_strength(dynamic_result)
-    if network_strength == 2:
-        evidence_items.append(_evidence_entry("dynamic", "archive_network_signal", 10, "archive", f"archive-level network communication observed ({len(linked_endpoints)} linked endpoint(s))", "high"))
-    elif network_strength == 1:
-        evidence_items.append(_evidence_entry("dynamic", "weak_archive_network_signal", 4, "archive", "unlinked network activity observed during sandbox run", "low"))
-    evidence_items.extend(archive_profile.get("evidence_items", []))
-    evidence_items = sorted(evidence_items, key=lambda e: abs(int(e.get("weight") or 0)), reverse=True)
-    deduped: list[dict[str, Any]] = []
-    seen = set()
-    for entry in evidence_items:
-        key = (entry.get("category"), entry.get("signal"), entry.get("source"), entry.get("detail"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(entry)
-    return deduped[:20]
-
-
-def calculate_score(scored_files: list[dict], dynamic_result: dict) -> dict[str, Any]:
+def calculate_score(scored_files: list[dict[str, Any]], dynamic_result: dict[str, Any]) -> dict[str, Any]:
     if not scored_files:
-        return {
-            "score": 0,
-            "raw_score": 0,
-            "verdict": "clean",
-            "file_count": 0,
-            "static_score": 0,
-            "dynamic_score": 0,
-            "aggregate_score": 0,
-            "developer_heavy": False,
-            "strong_override": False,
-            "dynamic_skipped": False,
-            "high_confidence_files": 0,
-            "high_severity_files": 0,
-            "malicious_static_bundle": False,
-            "evidence_reasons": [],
-            "evidence_list": [],
-            "score_breakdown": {"top_file": 0, "top3_average": 0, "distribution": 0, "archive_runtime": 0, "benign_penalty": 0},
-            "family_confidence": "low",
-        }
+        return {"score": 0, "raw_score": 0, "verdict": "clean"}
 
     archive_profile = _archive_profile(scored_files, dynamic_result)
     top_scores = [int(item.get("final_score") or item.get("score") or 0) for item in scored_files[:3]]
@@ -778,6 +451,7 @@ def calculate_score(scored_files: list[dict], dynamic_result: dict) -> dict[str,
     evidence_list = _aggregate_evidence_list(scored_files, dynamic_result, archive_profile)
     family_info = classify_family(scored_files, dynamic_result)
 
+
     return {
         "score": raw_score,
         "raw_score": raw_score,
@@ -786,25 +460,12 @@ def calculate_score(scored_files: list[dict], dynamic_result: dict) -> dict[str,
         "static_score": max_score,
         "dynamic_score": dynamic_bonus,
         "aggregate_score": distribution,
-        "developer_heavy": developer_heavy,
-        "strong_override": strong_override,
-        "dynamic_skipped": any(bool((item.get("member_runtime") or {}).get("skipped")) for item in scored_files if item.get("member_runtime")),
-        "high_confidence_files": malicious_count,
-        "high_severity_files": malicious_count + suspicious_count,
-        "malicious_static_bundle": malicious_count > 0,
-        "evidence_reasons": _top_reasons(scored_files, dynamic_result),
-        "evidence_list": evidence_list,
-        "malware_type_tags": _aggregate_malware_types(scored_files, dynamic_result),
-        "primary_malware_type": (_aggregate_malware_types(scored_files, dynamic_result)[0] if _aggregate_malware_types(scored_files, dynamic_result) else "unknown"),
+        "evidence_reasons": [],
         "score_breakdown": {
             "top_file": max_score,
             "top3_average": top3_avg,
             "distribution": distribution,
             "archive_runtime": dynamic_bonus,
-            "benign_penalty": benign_penalty,
+            "benign_penalty": 0,
         },
-        "family_confidence": family_info.get("confidence") or archive_profile.get("family_confidence", "low"),
-        "family_matches": family_info.get("family_matches") or [],
-        "primary_family": family_info.get("primary_family") or "unknown",
-        "archive_profile": archive_profile,
     }

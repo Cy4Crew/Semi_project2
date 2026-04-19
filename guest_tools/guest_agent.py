@@ -19,7 +19,11 @@ import psutil
 WORK_DIR = Path(os.environ.get("VM_WORK_DIR", r"C:\sandbox_work")).resolve()
 POLL_SECONDS = int(os.environ.get("VM_AGENT_POLL_SECONDS", "3"))
 SHARED_DIR = Path(os.environ.get("VM_SHARED_DIR") or r"\\vmware-host\Shared Folders\shared")
-
+try:
+    from sysmon_collector import collect_sysmon_events, clear_sysmon_log
+    SYSMON_AVAILABLE = True
+except ImportError:
+    SYSMON_AVAILABLE = False
 
 def _derive_candidate_paths(value: str) -> list[Path]:
     value = str(value or "").strip()
@@ -785,6 +789,8 @@ def analyze_job(job_dir: Path) -> dict:
     before_files = {str(p.relative_to(guest_job_root)) for p in guest_job_root.rglob("*") if p.is_file()}
     before_proc = process_snapshot()
     before_net = net_snapshot()
+    if SYSMON_AVAILABLE:
+        clear_sysmon_log()
     before_registry = collect_registry_snapshot()
     before_tasks = collect_scheduled_tasks()
     before_services = collect_services_snapshot()
@@ -879,6 +885,7 @@ def analyze_job(job_dir: Path) -> dict:
     external_monitor = collect_external_monitor_logs(outbox, timeline)
 
     registry_diff = diff_registry_snapshot(before_registry, after_registry)
+    sysmon_events = collect_sysmon_events() if SYSMON_AVAILABLE else []
     scheduled_task_diff = diff_named_items(before_tasks, after_tasks)
     service_diff = diff_named_items(before_services, after_services)
 
@@ -972,6 +979,7 @@ def analyze_job(job_dir: Path) -> dict:
         "registry_diff": registry_diff,
         "scheduled_tasks": scheduled_task_diff,
         "services": service_diff,
+        "sysmon_events": sysmon_events,
         "recursive_exec": {
             "enabled": True,
             "max_depth": MAX_RECURSIVE_EXEC_DEPTH,
