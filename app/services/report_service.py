@@ -95,9 +95,18 @@ def _failure_detail(item: dict, dynamic_result: dict | None = None, exc: Excepti
     return {k: v for k, v in detail.items() if v not in (None, "", [], {})}
 
 
-def _build_evidence_bundle(static_results: list[dict], dynamic_result: dict, verdict: dict, iocs: dict, normalized_iocs: dict, artifact_manifest: dict) -> dict:
+def _build_evidence_bundle(static_results: list[dict] | dict, dynamic_result: dict, verdict: dict, iocs: dict, normalized_iocs: dict, artifact_manifest: dict) -> dict:
+    if isinstance(static_results, dict):
+        static_items = static_results.get("files") or []
+    elif isinstance(static_results, list):
+        static_items = static_results
+    else:
+        static_items = []
+
     interesting_files = []
-    for item in static_results:
+    for item in static_items:
+        if not isinstance(item, dict):
+            continue
         if item.get("severity") in {"high", "medium"} or item.get("yara_matches"):
             interesting_files.append({
                 "file": item.get("file"),
@@ -214,7 +223,8 @@ def process_report(report_id: str) -> dict:
     try:
         stage_start = time.perf_counter()
         static_results = analyze_archive(sample_path)
-        record_stage_metric(report_id, "static_analysis", "done", duration_ms=int((time.perf_counter() - stage_start) * 1000), payload={"files": len(static_results or [])})
+        static_items = static_results.get("files", []) if isinstance(static_results, dict) else (static_results or [])
+        record_stage_metric(report_id, "static_analysis", "done", duration_ms=int((time.perf_counter() - stage_start) * 1000), payload={"files": len(static_items)})
         stage_start = time.perf_counter()
         dynamic_result = run_dynamic_analysis(sample_path, report_id, artifact_root)
         record_stage_metric(report_id, "dynamic_analysis", "done", duration_ms=int((time.perf_counter() - stage_start) * 1000), payload={"analysis_state": dynamic_result.get("analysis_state"), "exec_count": dynamic_result.get("archive_member_exec_count", 0)})
@@ -271,7 +281,7 @@ def process_report(report_id: str) -> dict:
             + (" Dynamic execution partially skipped due to unsupported format or sandbox limits." if dynamic_result.get("analysis_state") in {"partial", "static_only"} else "")
         )
 
-        evidence_bundle = _build_evidence_bundle(static_results, dynamic_result, verdict, iocs, normalized_iocs, artifact_manifest)
+        evidence_bundle = _build_evidence_bundle(static_results.get("files", []) if isinstance(static_results, dict) else static_results, dynamic_result, verdict, iocs, normalized_iocs, artifact_manifest)
 
         payload = {
             "report_id": report_id,
