@@ -19,11 +19,7 @@ import psutil
 WORK_DIR = Path(os.environ.get("VM_WORK_DIR", r"C:\sandbox_work")).resolve()
 POLL_SECONDS = int(os.environ.get("VM_AGENT_POLL_SECONDS", "3"))
 SHARED_DIR = Path(os.environ.get("VM_SHARED_DIR") or r"\\vmware-host\Shared Folders\shared")
-try:
-    from sysmon_collector import collect_sysmon_events, clear_sysmon_log
-    SYSMON_AVAILABLE = True
-except ImportError:
-    SYSMON_AVAILABLE = False
+
 
 def _derive_candidate_paths(value: str) -> list[Path]:
     value = str(value or "").strip()
@@ -434,11 +430,31 @@ def _sample_process_state(root_pid: int, path: Path) -> tuple[list[dict], list[d
     netrows: list[dict] = []
     if root_pid <= 0:
         return tree, netrows
+
+    related_markers = {str(path).lower(), str(path.name).lower(), str(path.parent).lower()}
+    procs: list[psutil.Process] = []
     try:
         root = psutil.Process(root_pid)
-        procs = [root] + root.children(recursive=True)
+        procs.extend([root] + root.children(recursive=True))
     except Exception:
-        procs = []
+        pass
+
+    # start/cmd 로 분기된 짧은 자식 프로세스는 마지막 샘플 시점에 root.children()에서 사라질 수 있어
+    # 최근 생성 + 같은 작업 폴더/스크립트 경로를 가진 프로세스를 추가로 모아 놓침을 줄인다.
+    now = time.time()
+    for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "create_time"]):
+        try:
+            info = proc.info
+            cmdline_parts = info.get("cmdline") or []
+            cmdline = " ".join(cmdline_parts).lower()
+            create_time = float(info.get("create_time") or 0.0)
+            recent = create_time > 0 and (now - create_time) <= max(20.0, float(POLL_SECONDS) * 8.0)
+            related = any(marker and marker in cmdline for marker in related_markers)
+            if related or recent and int(info.get("ppid") or 0) == root_pid:
+                procs.append(proc)
+        except Exception:
+            continue
+
     seen = set()
     for proc in procs:
         try:
@@ -457,7 +473,9 @@ def _sample_process_state(root_pid: int, path: Path) -> tuple[list[dict], list[d
                     netrows.append({'pid': proc.pid, 'remote_ip': str(remote_ip), 'remote_port': int(remote_port or 0), 'status': str(conn.status)})
         except Exception:
             continue
-    return tree[:40], netrows[:40]
+
+    tree.sort(key=lambda x: (int(x.get('ppid') or 0), int(x.get('pid') or 0), str(x.get('name') or '').lower()))
+    return tree[:80], netrows[:80]
 
 
 def _is_noise_created_path(path_str: str) -> bool:
@@ -544,8 +562,22 @@ def run_member(path: Path, timeout_seconds: int, out_dir: Path, timeline: list[d
             creationflags=CREATE_NO_WINDOW,
         )
         deadline = time.time() + timeout_seconds
+        seen_tree: set[tuple[int, int, str, str]] = set()
+        seen_net: set[tuple[int, str, int, str]] = set()
         while True:
-            process_tree_live, network_endpoints_live = _sample_process_state(proc.pid, path)
+            sampled_tree, sampled_net = _sample_process_state(proc.pid, path)
+            for row in sampled_tree:
+                key = (int(row.get('pid') or 0), int(row.get('ppid') or 0), str(row.get('name') or ''), str(row.get('cmdline') or ''))
+                if key in seen_tree:
+                    continue
+                seen_tree.add(key)
+                process_tree_live.append(row)
+            for row in sampled_net:
+                key = (int(row.get('pid') or 0), str(row.get('remote_ip') or ''), int(row.get('remote_port') or 0), str(row.get('status') or ''))
+                if key in seen_net:
+                    continue
+                seen_net.add(key)
+                network_endpoints_live.append(row)
             if proc.poll() is not None:
                 break
             if time.time() >= deadline:
@@ -789,8 +821,6 @@ def analyze_job(job_dir: Path) -> dict:
     before_files = {str(p.relative_to(guest_job_root)) for p in guest_job_root.rglob("*") if p.is_file()}
     before_proc = process_snapshot()
     before_net = net_snapshot()
-    if SYSMON_AVAILABLE:
-        clear_sysmon_log()
     before_registry = collect_registry_snapshot()
     before_tasks = collect_scheduled_tasks()
     before_services = collect_services_snapshot()
@@ -885,7 +915,6 @@ def analyze_job(job_dir: Path) -> dict:
     external_monitor = collect_external_monitor_logs(outbox, timeline)
 
     registry_diff = diff_registry_snapshot(before_registry, after_registry)
-    sysmon_events = collect_sysmon_events() if SYSMON_AVAILABLE else []
     scheduled_task_diff = diff_named_items(before_tasks, after_tasks)
     service_diff = diff_named_items(before_services, after_services)
 
@@ -979,7 +1008,6 @@ def analyze_job(job_dir: Path) -> dict:
         "registry_diff": registry_diff,
         "scheduled_tasks": scheduled_task_diff,
         "services": service_diff,
-        "sysmon_events": sysmon_events,
         "recursive_exec": {
             "enabled": True,
             "max_depth": MAX_RECURSIVE_EXEC_DEPTH,
