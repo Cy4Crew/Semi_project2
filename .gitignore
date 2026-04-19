@@ -56,3 +56,4 @@ temp/
 *.gz
 
 .env
+host_bridge/workspace/shared/*.json
