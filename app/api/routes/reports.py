@@ -540,7 +540,7 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
     file_count = int(len(display_files) or static_summary.get("file_count", 0) or 0)
     malware_types = _as_list(item.get("malware_type_tags") or iocs.get("malware_types") or [])
     yara_matches = _as_list(iocs.get("yara_matches", []))
-    exec_count = int(dynamic_result.get("archive_member_exec_count", 0) or 0)
+    exec_count = int(dynamic_result.get("archive_member_success_count", 0) or 0)
     skipped_count = int(dynamic_result.get("archive_member_skipped_count", 0) or 0)
     network_endpoints = _as_list(_as_dict(dynamic_result.get("network_trace")).get("endpoints"))
     dropped_files_raw = _as_list(evidence_bundle.get("dropped_files") or _as_dict(dynamic_result.get("filesystem_delta")).get("created_details"))
@@ -718,11 +718,13 @@ def report_view(report_id: str, token: str | None = Query(default=None)):
         <div class='metrics'>
           <div class='metric'><span>Risk score</span><strong>{score}/100</strong></div>
           <div class='metric'><span>Files analyzed</span><strong>{file_count}</strong></div>
-          <div class='metric'><span>Executed</span><strong>{exec_count}</strong></div>
-          <div class='metric'><span>Failed exec</span><strong>{failed_count}</strong></div>
+          <div class='metric'><span>Execution success</span><strong>{_e(dynamic_result.get('archive_member_success_count', 0))}</strong></div>
+          <div class='metric'><span>Execution failed</span><strong>{_e(dynamic_result.get('archive_member_failed_count', 0))}</strong></div>
           <div class='metric'><span>Network endpoints</span><strong>{len(network_endpoints)}</strong></div>
           <div class='metric'><span>Dropped files</span><strong>{len(dropped_files)}</strong></div>
-          <div class='metric'><span>Attempted exec</span><strong>{_e(dynamic_result.get('archive_member_attempted_count', 0))}</strong></div>
+          <div class='metric'><span>Execution attempted</span><strong>{_e(dynamic_result.get('archive_member_attempted_count', 0))}</strong></div>
+          <div class='metric'><span>Behavior observed</span><strong>{_e(dynamic_result.get('archive_member_behavior_observed_count', 0))}</strong></div>
+          <div class='metric'><span>AV blocked</span><strong>{_e(dynamic_result.get('archive_member_av_blocked_count', 0))}</strong></div>
           <div class='metric'><span>Processes</span><strong>{len(process_tree_rows)}</strong></div>
           <div class='metric'><span>Spawn alerts</span><strong>{len(spawn_events)}</strong></div>
           <div class='metric'><span>Family confidence</span><strong>{_e(family_confidence.upper())}</strong></div>

@@ -65,18 +65,44 @@ def _filter_filesystem_delta(fs_delta: dict[str, Any]) -> dict[str, list[str]]:
     return out
 
 def _summarize_exec_activity(exec_results: list[dict[str, Any]]) -> dict[str, Any]:
-    attempted = executed = successful = 0
+    attempted = executed = successful = failed = timed_out = av_blocked = behavior_observed = crashed = 0
     for r in exec_results:
         was_attempted = bool(r.get("attempted")) or str(r.get("strategy") or "").lower() in {"native", "guest_native", "strings_only"}
         was_executed = was_attempted and not bool(r.get("skipped"))
         was_success = bool(r.get("succeeded")) or (was_executed and int(r.get("returncode", 0) or 0) == 0 and not bool(r.get("timed_out")))
+        skip_reason = str(r.get("skip_reason") or "").lower()
+        behavior = r.get("behavior") or {}
+        was_behavior_observed = bool(behavior.get("execution_signal")) or bool(was_success)
+        was_timed_out = bool(r.get("timed_out"))
+        was_av_blocked = "winerror 225" in skip_reason or "virus" in skip_reason or "user consent" in skip_reason
+        was_failed = bool(r.get("failed")) or (was_attempted and not was_success and not bool(r.get("skipped")))
+        was_crashed = was_failed and not was_timed_out and not was_av_blocked and int(r.get("returncode", 0) or 0) not in {0, 1}
         if was_attempted:
             attempted += 1
         if was_executed:
             executed += 1
         if was_success:
             successful += 1
-    return {"attempted_count": attempted, "executed_count": executed, "successful_count": successful}
+        if was_failed:
+            failed += 1
+        if was_timed_out:
+            timed_out += 1
+        if was_av_blocked:
+            av_blocked += 1
+        if was_behavior_observed:
+            behavior_observed += 1
+        if was_crashed:
+            crashed += 1
+    return {
+        "attempted_count": attempted,
+        "executed_count": executed,
+        "successful_count": successful,
+        "failed_count": failed,
+        "timed_out_count": timed_out,
+        "av_blocked_count": av_blocked,
+        "behavior_observed_count": behavior_observed,
+        "crash_count": crashed,
+    }
 
 def _process_snapshot() -> list[dict[str, Any]]:
     out = []
@@ -341,6 +367,13 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
     fs_delta = _filter_filesystem_delta(raw_fs_delta)
     exec_activity = _summarize_exec_activity(exec_results)
     archive_success_count = int(exec_activity.get("successful_count", 0))
+    archive_executed_count = int(exec_activity.get("executed_count", 0))
+    archive_attempted_count = int(exec_activity.get("attempted_count", 0))
+    archive_failed_count = int(exec_activity.get("failed_count", 0))
+    archive_timed_out_count = int(exec_activity.get("timed_out_count", 0))
+    archive_av_blocked_count = int(exec_activity.get("av_blocked_count", 0))
+    archive_behavior_observed_count = int(exec_activity.get("behavior_observed_count", 0))
+    archive_crash_count = int(exec_activity.get("crash_count", 0))
     process_delta = _estimate_process_delta(proc_before, proc_after, exec_results)
     filtered_trace = _filter_network_trace(trace, exec_results)
     sysmon_summary = _build_synthetic_sysmon_summary(exec_results, process_delta, fs_delta, filtered_trace)
@@ -373,10 +406,15 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
         "anti_analysis_signal": anti_analysis_signal,
         "ransomware_signal": False,
         "archive_file_count": sum(1 for p in extract_dir.rglob("*") if p.is_file()) if extract_dir.exists() else 1,
-        "archive_member_exec_count": int(exec_activity.get("executed_count", 0)),
+        "archive_member_exec_count": archive_executed_count,
         "archive_member_skipped_count": sum(1 for r in exec_results if bool(r.get("skipped"))),
-        "archive_member_attempted_count": int(exec_activity.get("attempted_count", 0)),
+        "archive_member_attempted_count": archive_attempted_count,
         "archive_member_success_count": archive_success_count,
+        "archive_member_failed_count": archive_failed_count,
+        "archive_member_timeout_count": archive_timed_out_count,
+        "archive_member_av_blocked_count": archive_av_blocked_count,
+        "archive_member_behavior_observed_count": archive_behavior_observed_count,
+        "archive_member_crash_count": archive_crash_count,
         "archive_member_results": [{
             "path": r.get("path"),
             "member_path": r.get("member_path"),
@@ -395,8 +433,16 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
             "behavior": r.get("behavior") or {"execution_signal": bool(r.get("succeeded"))},
             "process_tree_live": [],
             "network_endpoints_live": [],
-            "execution_observed": execution_observed,
-            "anti_analysis": anti_analysis_signal,
+            "execution_observed": bool((r.get("behavior") or {}).get("execution_signal")) or bool(r.get("succeeded")),
+            "anti_analysis": bool((r.get("behavior") or {}).get("anti_analysis")),
+            "execution_status": (
+                "av_blocked" if ("winerror 225" in str(r.get("skip_reason") or "").lower() or "virus" in str(r.get("skip_reason") or "").lower() or "user consent" in str(r.get("skip_reason") or "").lower())
+                else "timeout" if bool(r.get("timed_out"))
+                else "success" if bool(r.get("succeeded"))
+                else "failed" if bool(r.get("failed"))
+                else "attempted" if bool(r.get("attempted"))
+                else "skipped"
+            ),
             "sysmon_summary": {
                 "matched_event_count": sysmon_summary.get("matched_event_count", 0),
                 "anti_analysis_count": len(sysmon_summary.get("anti_analysis_signals", [])),
@@ -407,8 +453,8 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
         "combined_output_preview": (combined_stdout + "\n" + combined_stderr).strip()[:4000],
         "score": 0,
         "analysis_state": "partial" if exec_results else "complete",
-        "dynamic_status": "executed" if execution_observed else ("attempted" if int(exec_activity.get("attempted_count", 0)) > 0 else "not_executed"),
-        "dynamic_reason": ("anti_analysis_behavior_observed" if anti_analysis_signal else None) if execution_observed else ("members_attempted_but_no_observed_behavior" if int(exec_activity.get("attempted_count", 0)) > 0 else "no_member_executed"),
+        "dynamic_status": "executed" if execution_observed else ("attempted" if archive_attempted_count > 0 else "not_executed"),
+        "dynamic_reason": ("anti_analysis_behavior_observed" if anti_analysis_signal else None) if execution_observed else ("members_attempted_but_no_observed_behavior" if archive_attempted_count > 0 else "no_member_executed"),
         "sandbox_profile": {"backend": "local", "runtime_root": str(work_dir)},
     }
     shutil.rmtree(work_dir, ignore_errors=True)

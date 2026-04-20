@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     yara_rules_dir: str = str(BASE_DIR / "rules")
     report_db_path: str = str(BASE_DIR / "artifacts" / "reports.db")
 
-    sample_timeout_seconds: int = 5
+    sample_timeout_seconds: int = 25
     max_archive_files: int = 100
     max_archive_exec_members: int = 8
     entropy_threshold: float = 7.2
