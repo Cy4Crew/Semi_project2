@@ -21,6 +21,11 @@ from app.sandbox.network_monitor import reserve_pcap_path, start_network_capture
 from app.sandbox.vmware_bridge_backend import run_vmware_bridge_analysis
 from app.utils.subprocess_helper import run_command
 
+try:
+    from sysmon_collector import summarize_sysmon_events
+except Exception:
+    summarize_sysmon_events = None
+
 EXECUTABLE_SUFFIXES = {".py", ".sh", ".js", ".ps1", ".bat", ".cmd", ".exe", ".dll", ".com", ".scr", ".vbs"}
 STRINGS_ONLY_SUFFIXES = {".exe", ".dll", ".com", ".scr"}
 SKIP_PARTS = {"__pycache__", ".git", ".idea", ".vscode", "node_modules", ".pytest_cache"}
@@ -125,6 +130,52 @@ def _filter_network_trace(trace: dict[str, Any], exec_results: list[dict[str, An
     if conns and not filtered:
         out["noise_reason"] = "sandbox_background_traffic"
     return out
+
+
+
+def _build_synthetic_sysmon_summary(exec_results: list[dict[str, Any]], process_delta: dict[str, Any], fs_delta: dict[str, Any], trace: dict[str, Any]) -> dict[str, Any]:
+    anti = []
+    proc_rows = []
+    for row in process_delta.get("new_process_tree", []) or []:
+        cmd = " ".join(row.get("cmdline") or []) if isinstance(row.get("cmdline"), list) else str(row.get("cmdline") or "")
+        proc_rows.append({
+            "pid": row.get("pid"),
+            "name": row.get("name"),
+            "cmdline": cmd,
+            "parent_image": "",
+            "parent_command_line": "",
+            "time": "",
+        })
+        lowered = f"{row.get('name') or ''} {cmd}".lower()
+        if "taskkill" in lowered and "taskmgr.exe" in lowered:
+            anti.append({
+                "signal": "taskkill_taskmgr",
+                "image": row.get("name") or "",
+                "command_line": cmd,
+                "parent_image": "",
+                "time": "",
+            })
+    network = []
+    for row in trace.get("connections", []) or []:
+        network.append({
+            "pid": row.get("pid", 0),
+            "remote_ip": row.get("remote_ip") or row.get("dst_ip") or "",
+            "remote_port": int(row.get("remote_port") or row.get("dst_port") or 0),
+            "status": row.get("status") or "connected",
+            "image": row.get("process") or row.get("image") or "",
+            "time": "",
+        })
+    return {
+        "event_count": len(proc_rows) + len(network),
+        "matched_event_count": len(proc_rows) + len(network),
+        "execution_observed": bool(proc_rows) or bool(network) or bool(fs_delta.get("created")),
+        "process_tree": proc_rows[:40],
+        "registry_changes": [],
+        "network_endpoints": network[:40],
+        "dns_queries": [],
+        "anti_analysis_signals": anti[:20],
+        "image_loads": [],
+    }
 
 def _strings_command(sample_path: str, limit: int) -> list[str]:
     quoted = shlex.quote(sample_path)
@@ -301,6 +352,9 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
     archive_success_count = int(exec_activity.get("successful_count", 0))
     process_delta = _estimate_process_delta(proc_before, proc_after, exec_results)
     filtered_trace = _filter_network_trace(trace, exec_results)
+    sysmon_summary = _build_synthetic_sysmon_summary(exec_results, process_delta, fs_delta, filtered_trace)
+    execution_observed = bool(sysmon_summary.get("execution_observed"))
+    anti_analysis_signal = bool(sysmon_summary.get("anti_analysis_signals"))
 
     combined_stdout = "\n\n".join((r.get("stdout") or "") for r in exec_results).strip()
     combined_stderr = "\n\n".join((r.get("stderr") or "") for r in exec_results).strip()
@@ -321,9 +375,13 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
         "process_delta": process_delta,
         "network_trace": filtered_trace,
         "network_signal": bool(filtered_trace.get("connections")),
-        "exec_signal": archive_success_count > 0,
+        "exec_signal": execution_observed,
+        "execution_observed": execution_observed,
         "persistence_signal": False,
-        "file_signal": bool(fs_delta.get("created") or fs_delta.get("changed") or fs_delta.get("deleted")) and archive_success_count > 0,
+        "file_signal": bool(fs_delta.get("created") or fs_delta.get("changed") or fs_delta.get("deleted")),
+        "sysmon_summary": sysmon_summary,
+        "sysmon_events": [],
+        "anti_analysis_signal": anti_analysis_signal,
         "ransomware_signal": False,
         "archive_file_count": sum(1 for p in extract_dir.rglob("*") if p.is_file()) if extract_dir.exists() else 1,
         "archive_member_exec_count": int(exec_activity.get("executed_count", 0)),
@@ -348,12 +406,20 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
             "behavior": r.get("behavior") or {"execution_signal": bool(r.get("succeeded"))},
             "process_tree_live": [],
             "network_endpoints_live": [],
+            "execution_observed": execution_observed,
+            "anti_analysis": anti_analysis_signal,
+            "sysmon_summary": {
+                "matched_event_count": sysmon_summary.get("matched_event_count", 0),
+                "anti_analysis_count": len(sysmon_summary.get("anti_analysis_signals", [])),
+                "registry_change_count": len(sysmon_summary.get("registry_changes", [])),
+                "network_endpoint_count": len(sysmon_summary.get("network_endpoints", [])),
+            },
         } for r in exec_results],
         "combined_output_preview": (combined_stdout + "\n" + combined_stderr).strip()[:4000],
         "score": 0,
         "analysis_state": "partial" if exec_results else "complete",
-        "dynamic_status": "executed" if archive_success_count > 0 else ("attempted" if int(exec_activity.get("attempted_count", 0)) > 0 else "not_executed"),
-        "dynamic_reason": None if archive_success_count > 0 else ("members_attempted_but_no_successful_execution" if int(exec_activity.get("attempted_count", 0)) > 0 else "no_member_executed"),
+        "dynamic_status": "executed" if execution_observed else ("attempted" if int(exec_activity.get("attempted_count", 0)) > 0 else "not_executed"),
+        "dynamic_reason": ("anti_analysis_behavior_observed" if anti_analysis_signal else None) if execution_observed else ("members_attempted_but_no_observed_behavior" if int(exec_activity.get("attempted_count", 0)) > 0 else "no_member_executed"),
         "sandbox_profile": {"backend": "local", "runtime_root": str(work_dir)},
     }
     shutil.rmtree(work_dir, ignore_errors=True)

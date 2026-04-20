@@ -10,7 +10,7 @@ When enabled, Sysmon telemetry is collected automatically during execution and e
 
 ## Implemented Components
 
-### Sysmon Installation
+### [Sysmon Installation](https://download.sysinternals.com/files/Sysmon.zip)
 
 Recommended path:
 
