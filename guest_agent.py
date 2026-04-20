@@ -103,6 +103,7 @@ def resolve_shared_dir() -> Path:
 
 
 MAX_RECURSIVE_EXEC_TARGETS = int(os.environ.get("MAX_RECURSIVE_EXEC_TARGETS", "8"))
+ARCHIVE_PASSWORDS = [token.strip().encode("utf-8", errors="ignore") for token in os.environ.get("ARCHIVE_PASSWORDS", "infected,malware,infected!,virus").split(",") if token.strip()]
 MAX_RECURSIVE_EXEC_DEPTH = int(os.environ.get("MAX_RECURSIVE_EXEC_DEPTH", "2"))
 
 EXEC_SUFFIXES = {'.py', '.ps1', '.bat', '.cmd', '.exe', '.dll', '.js', '.vbs', '.docm', '.xlsm', '.doc', '.docx', '.xls', '.xlsx', '.lnk', '.pdf', '.zip'}
@@ -193,6 +194,18 @@ def net_snapshot() -> list[dict]:
     return rows[:300]
 
 
+def _open_zip_member(zf: zipfile.ZipFile, member: zipfile.ZipInfo):
+    encrypted = bool(getattr(member, "flag_bits", 0) & 0x1)
+    if not encrypted:
+        return zf.open(member)
+    last_error = None
+    for password in ARCHIVE_PASSWORDS:
+        try:
+            return zf.open(member, pwd=password)
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"encrypted_zip_unsupported_or_bad_password:{member.filename}:{last_error}")
+
 def safe_extract(zip_path: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -204,7 +217,7 @@ def safe_extract(zip_path: Path, dest: Path) -> None:
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(member) as src, open(target, "wb") as dst:
+            with _open_zip_member(zf, member) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
 
 

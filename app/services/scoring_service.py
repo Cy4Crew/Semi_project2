@@ -80,6 +80,7 @@ def _dynamic_context(dynamic_result: dict[str, Any]) -> dict[str, Any]:
         "anti_signals": anti_signals,
         "registry_changes": registry_changes,
         "network_endpoints": network_endpoints,
+        "global_dynamic_score": 0,
     }
 
 
@@ -214,26 +215,6 @@ def calculate_file_assessment(static_item: dict[str, Any], dynamic_result: dict[
     reasons.extend(behavior["reasons"])
     evidence.extend(behavior["evidence"])
 
-    if ctx["anti_analysis"]:
-        score = max(score, MALICIOUS_EXEC_FLOOR)
-        reasons.append("anti-analysis signal in dynamic telemetry")
-        evidence.append(_evidence("dynamic", "anti_analysis_global", 35, path, "taskkill/taskmgr or similar anti-analysis behavior observed"))
-
-    if ctx["execution_observed"] and suffix == ".exe" and not behavior["executed"]:
-        score = max(score, SUSPICIOUS_EXEC_FLOOR)
-        reasons.append("execution observed via telemetry")
-        evidence.append(_evidence("dynamic", "execution_observed", 16, path, "telemetry observed even without clean success return code"))
-
-    if ctx["registry_changes"]:
-        score += 8
-        reasons.append("registry modifications observed")
-        evidence.append(_evidence("dynamic", "registry_change", 8, path, f"observed {len(ctx['registry_changes'])} registry changes"))
-
-    if ctx["network_endpoints"]:
-        score += 8
-        reasons.append("network activity observed")
-        evidence.append(_evidence("dynamic", "network_activity", 8, path, f"observed {len(ctx['network_endpoints'])} network endpoints"))
-
     av_blocked = bool(behavior.get("av_blocked"))
     suspicious_static_combo = bool(suspicious_imports) and entropy >= float(getattr(settings, "entropy_threshold", 7.2) or 7.2)
     suspicious_signal = suspicious_static_combo or bool(families) or bool(yara_hits)
@@ -264,7 +245,7 @@ def calculate_file_assessment(static_item: dict[str, Any], dynamic_result: dict[
             "primary_malware_type": (tags or ["unknown"])[0],
             "summary_reasons": list(dict.fromkeys(reasons))[:10],
             "executed": behavior["executed"] or behavior.get("execution_observed"),
-            "anti_analysis": behavior.get("anti_analysis") or ctx.get("anti_analysis"),
+            "anti_analysis": behavior.get("anti_analysis"),
             "top_evidence": [x["summary"] for x in sorted(evidence, key=lambda e: abs(int(e.get("weight", 0))), reverse=True)[:3]],
             "evidence_items": sorted(evidence, key=lambda e: abs(int(e.get("weight", 0))), reverse=True)[:12],
             "severity": _severity_from_score(final_score),
@@ -289,25 +270,38 @@ def calculate_score(scored_files: list[dict[str, Any]], dynamic_result: dict[str
     if not scored_files:
         return {"score": 0, "raw_score": 0, "verdict": "clean"}
 
-    top_scores = [int(x.get("final_score", 0)) for x in scored_files[:3]]
+    top_scores = [int(x.get("final_score", x.get("score", 0)) or 0) for x in scored_files[:3]]
     max_score = max(top_scores)
     avg3 = round(sum(top_scores) / len(top_scores))
 
-    malicious = sum(1 for x in scored_files if x.get("final_verdict") == "malicious")
-    suspicious = sum(1 for x in scored_files if x.get("final_verdict") == "suspicious")
-    review = sum(1 for x in scored_files if x.get("final_verdict") == "review")
+    malicious = sum(1 for x in scored_files if str(x.get("final_verdict", x.get("verdict", ""))).lower() == "malicious")
+    suspicious = sum(1 for x in scored_files if str(x.get("final_verdict", x.get("verdict", ""))).lower() == "suspicious")
+    review = sum(1 for x in scored_files if str(x.get("final_verdict", x.get("verdict", ""))).lower() == "review")
 
     distribution = min(12, malicious * 4 + suspicious * 2 + review)
     sysmon_summary = dynamic_result.get("sysmon_summary") or {}
     anti_analysis = bool(dynamic_result.get("anti_analysis_signal")) or bool(sysmon_summary.get("anti_analysis_signals"))
     observed = bool(dynamic_result.get("execution_observed")) or bool(sysmon_summary.get("execution_observed"))
     dynamic_bonus = 0
-    if int(dynamic_result.get("archive_member_success_count", 0)) > 0:
+    attempted_count = int(dynamic_result.get("archive_member_attempted_count", 0) or 0)
+    success_count = int(dynamic_result.get("archive_member_success_count", 0) or 0)
+    behavior_observed_count = int(dynamic_result.get("archive_member_behavior_observed_count", 0) or 0)
+    av_blocked_count = int(dynamic_result.get("archive_member_av_blocked_count", 0) or 0)
+    timeout_count = int(dynamic_result.get("archive_member_timeout_count", 0) or 0)
+    crash_count = int(dynamic_result.get("archive_member_crash_count", 0) or 0)
+
+    if success_count > 0:
         dynamic_bonus += 6
-    if observed:
+    if behavior_observed_count > 0 or observed:
         dynamic_bonus += 6
     if anti_analysis:
         dynamic_bonus += 18
+    if av_blocked_count > 0:
+        dynamic_bonus += min(10, av_blocked_count * 3)
+    if timeout_count > 0 or crash_count > 0:
+        dynamic_bonus += min(6, timeout_count + crash_count)
+    if attempted_count > 0 and success_count <= 0 and not observed:
+        dynamic_bonus += 2
 
     raw = round(max_score * 0.55 + avg3 * 0.20 + distribution + dynamic_bonus)
 
@@ -334,6 +328,12 @@ def calculate_score(scored_files: list[dict[str, Any]], dynamic_result: dict[str
             "top3_average": avg3,
             "distribution": distribution,
             "archive_runtime": dynamic_bonus,
+            "attempted_count": attempted_count,
+            "success_count": success_count,
+            "behavior_observed_count": behavior_observed_count,
+            "av_blocked_count": av_blocked_count,
+            "timeout_count": timeout_count,
+            "crash_count": crash_count,
             "benign_penalty": 0,
         },
     }

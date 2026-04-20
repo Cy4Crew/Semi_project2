@@ -253,6 +253,18 @@ def _execute_one(sample_path: str, timeout_seconds: int, analysis_log_path: Path
     _append_stage(analysis_log_path, "execute_end", role=role, returncode=result["returncode"], timed_out=result["timed_out"], strategy=result["strategy"], skipped=result["skipped"])
     return result
 
+def _open_zip_member(zf: zipfile.ZipFile, member: zipfile.ZipInfo):
+    encrypted = bool(getattr(member, "flag_bits", 0) & 0x1)
+    if not encrypted:
+        return zf.open(member)
+    last_error = None
+    for password in settings.archive_password_list:
+        try:
+            return zf.open(member, pwd=password)
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"encrypted_zip_unsupported_or_bad_password:{member.filename}:{last_error}")
+
 def _safe_extract(zip_path: Path, extract_dir: Path) -> None:
     root = extract_dir.resolve()
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -265,7 +277,7 @@ def _safe_extract(zip_path: Path, extract_dir: Path) -> None:
             if os.path.commonpath([str(target), str(root)]) != str(root):
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(member) as src, open(target, "wb") as dst:
+            with _open_zip_member(zf, member) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
 
 def _list_exec_candidates(root: Path) -> list[Path]:

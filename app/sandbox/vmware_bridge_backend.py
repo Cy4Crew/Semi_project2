@@ -95,16 +95,48 @@ def _member_was_attempted(member: dict[str, Any]) -> bool:
 
 def _member_was_successful(member: dict[str, Any]) -> bool:
     status = _lower_str(member.get("execution_status") or member.get("status"))
-    if member.get("executed") is True or member.get("success") is True:
+    if member.get("executed") is True or member.get("success") is True or member.get("succeeded") is True:
         return True
     return status in {"executed", "success", "completed", "ok"}
 
 
+def _member_behavior_observed(member: dict[str, Any]) -> bool:
+    if bool(member.get("execution_observed")):
+        return True
+    behavior = member.get("behavior") or {}
+    if isinstance(behavior, dict) and bool(behavior.get("execution_signal")):
+        return True
+    status = _lower_str(member.get("execution_status") or member.get("status"))
+    return status in {"success", "executed", "completed", "ok", "behavior_observed"}
 
-def _normalize_member_results(raw_members: Any) -> tuple[list[dict[str, Any]], set[str], set[str]]:
+
+def _member_is_av_blocked(member: dict[str, Any]) -> bool:
+    skip_reason = _lower_str(member.get("skip_reason") or member.get("reason") or member.get("error"))
+    status = _lower_str(member.get("execution_status") or member.get("status"))
+    return status == "av_blocked" or "winerror 225" in skip_reason or "virus" in skip_reason or "user consent" in skip_reason
+
+
+def _member_is_timed_out(member: dict[str, Any]) -> bool:
+    status = _lower_str(member.get("execution_status") or member.get("status"))
+    return bool(member.get("timed_out")) or status in {"timeout", "timed_out"}
+
+
+def _member_failed(member: dict[str, Any]) -> bool:
+    status = _lower_str(member.get("execution_status") or member.get("status"))
+    if bool(member.get("failed")):
+        return True
+    return status in {"failed", "error", "crash", "crashed", "timeout", "timed_out", "av_blocked"}
+
+
+
+def _normalize_member_results(raw_members: Any) -> tuple[list[dict[str, Any]], set[str], set[str], set[str], set[str], set[str], set[str]]:
     normalized: list[dict[str, Any]] = []
     attempted_paths: set[str] = set()
     successful_paths: set[str] = set()
+    behavior_observed_paths: set[str] = set()
+    av_blocked_paths: set[str] = set()
+    timed_out_paths: set[str] = set()
+    failed_paths: set[str] = set()
     for item in raw_members or []:
         if not isinstance(item, dict):
             continue
@@ -120,7 +152,15 @@ def _normalize_member_results(raw_members: Any) -> tuple[list[dict[str, Any]], s
             attempted_paths.add(normalized_path)
         if _member_was_successful(member) and normalized_path:
             successful_paths.add(normalized_path)
-    return normalized, attempted_paths, successful_paths
+        if _member_behavior_observed(member) and normalized_path:
+            behavior_observed_paths.add(normalized_path)
+        if _member_is_av_blocked(member) and normalized_path:
+            av_blocked_paths.add(normalized_path)
+        if _member_is_timed_out(member) and normalized_path:
+            timed_out_paths.add(normalized_path)
+        if _member_failed(member) and normalized_path:
+            failed_paths.add(normalized_path)
+    return normalized, attempted_paths, successful_paths, behavior_observed_paths, av_blocked_paths, timed_out_paths, failed_paths
 
 
 
@@ -221,9 +261,13 @@ def _normalize_timeline(raw_timeline: Any, member_paths: set[str], success_count
 
 
 def _normalize_bridge_result(result: dict[str, Any]) -> dict[str, Any]:
-    archive_member_results, attempted_paths, successful_paths = _normalize_member_results(result.get("archive_member_results", []))
+    archive_member_results, attempted_paths, successful_paths, behavior_observed_paths, av_blocked_paths, timed_out_paths, failed_paths = _normalize_member_results(result.get("archive_member_results", []))
     attempted_count = len(attempted_paths)
     success_count = len(successful_paths)
+    behavior_observed_count = len(behavior_observed_paths)
+    av_blocked_count = len(av_blocked_paths)
+    timed_out_count = len(timed_out_paths)
+    failed_count = len(failed_paths)
 
     filesystem_delta, file_signal = _normalize_filesystem_delta(result.get("filesystem_delta"))
     if success_count <= 0:
@@ -248,7 +292,12 @@ def _normalize_bridge_result(result: dict[str, Any]) -> dict[str, Any]:
         "archive_member_results": archive_member_results,
         "archive_member_attempted_count": attempted_count,
         "archive_member_success_count": success_count,
-        "archive_member_exec_count": success_count,
+        "archive_member_exec_count": attempted_count,
+        "archive_member_failed_count": failed_count,
+        "archive_member_timeout_count": timed_out_count,
+        "archive_member_av_blocked_count": av_blocked_count,
+        "archive_member_behavior_observed_count": behavior_observed_count,
+        "archive_member_crash_count": max(0, failed_count - timed_out_count - av_blocked_count),
         "archive_member_skipped_count": max(0, _safe_int(result.get("archive_member_skipped_count"))),
         "archive_file_count": max(_safe_int(result.get("archive_file_count")), len(archive_member_results)),
         "exec_signal": exec_signal,
@@ -305,6 +354,11 @@ def _submit_to_slot(slot, sample_path: str, report_id: str, artifact_root: str) 
         'archive_member_exec_count': normalized['archive_member_exec_count'],
         'archive_member_attempted_count': normalized['archive_member_attempted_count'],
         'archive_member_success_count': normalized['archive_member_success_count'],
+        'archive_member_failed_count': normalized['archive_member_failed_count'],
+        'archive_member_timeout_count': normalized['archive_member_timeout_count'],
+        'archive_member_av_blocked_count': normalized['archive_member_av_blocked_count'],
+        'archive_member_behavior_observed_count': normalized['archive_member_behavior_observed_count'],
+        'archive_member_crash_count': normalized['archive_member_crash_count'],
         'archive_member_skipped_count': normalized['archive_member_skipped_count'],
         'archive_member_results': normalized['archive_member_results'],
         'combined_output_preview': result.get('combined_output_preview', ''),

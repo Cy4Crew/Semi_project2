@@ -94,8 +94,9 @@ def _validate_zip_archive(sample_path: Path) -> None:
             if Path(name).is_absolute() or any(part in _DANGEROUS_ZIP_PARTS for part in normalized_parts):
                 raise HTTPException(status_code=400, detail=f"Unsafe ZIP path detected: {name}")
 
-            if info.flag_bits & 0x1 and bool(settings.reject_encrypted_archives):
-                raise HTTPException(status_code=400, detail="Encrypted ZIP entries are not supported.")
+            if info.flag_bits & 0x1:
+                if bool(settings.reject_encrypted_archives) and not settings.archive_password_list:
+                    raise HTTPException(status_code=400, detail="Encrypted ZIP entries are not supported without configured archive passwords.")
 
             if info.is_dir():
                 continue

@@ -270,7 +270,10 @@ def process_report(report_id: str) -> dict:
         summary = (
             f"{original_filename} analyzed as {verdict['verdict'].upper()} with risk score {verdict['score']}/100 "
             f"(static={verdict.get('static_score', 0)}, dynamic={verdict.get('dynamic_score', 0)}). "
-            f"Executed archive members: {dynamic_result.get('archive_member_exec_count', 0)}. "
+            f"Attempted archive members: {dynamic_result.get('archive_member_attempted_count', 0)}. "
+            f"Successful archive members: {dynamic_result.get('archive_member_success_count', 0)}. "
+            f"Behavior-observed archive members: {dynamic_result.get('archive_member_behavior_observed_count', 0)}. "
+            f"AV-blocked archive members: {dynamic_result.get('archive_member_av_blocked_count', 0)}. "
             f"Failed archive members: {dynamic_result.get('archive_member_failed_count', 0)}. "
             f"Skipped archive members: {dynamic_result.get('archive_member_skipped_count', 0)}."
             + (f" Dynamic note: {dynamic_result.get('dynamic_reason')}." if dynamic_result.get('dynamic_reason') else "")

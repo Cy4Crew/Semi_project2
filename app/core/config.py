@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     report_db_path: str = str(BASE_DIR / "artifacts" / "reports.db")
 
     sample_timeout_seconds: int = 5
+    archive_passwords: str = "infected,malware,infected!,virus"
     max_archive_files: int = 100
     max_archive_exec_members: int = 8
     entropy_threshold: float = 7.2
@@ -33,7 +34,7 @@ class Settings(BaseSettings):
     max_zip_entry_uncompressed_bytes: int = 20 * 1024 * 1024
     max_zip_compression_ratio: float = 250.0
     max_zip_depth_hint: int = 3
-    reject_encrypted_archives: bool = True
+    reject_encrypted_archives: bool = False
     allowed_upload_extensions: str = ".zip"
     allowed_upload_content_types: str = "application/zip,application/x-zip-compressed,multipart/x-zip"
     allowed_upload_magic_hex: str = "504b0304,504b0506,504b0708"
@@ -109,6 +110,16 @@ class Settings(BaseSettings):
     report_hidden_reason_tokens: str = (
         "text-like file cap,test artifact cap,text evidence cap,low-risk document cap,ignored analysis artifact"
     )
+
+
+    @property
+    def archive_password_list(self) -> list[bytes]:
+        out: list[bytes] = []
+        for item in str(self.archive_passwords or "").split(","):
+            token = item.strip()
+            if token:
+                out.append(token.encode("utf-8", errors="ignore"))
+        return out
 
     @property
     def artifact_output_name_set(self) -> set[str]:
