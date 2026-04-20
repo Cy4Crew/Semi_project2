@@ -38,6 +38,7 @@ def _get_scan_roots() -> list[Path]:
         Path(r"C:\Windows\SysWOW64"),                                                      # 32bit dll
         Path(user_profile) / "Desktop",                                                   # 바탕화면 (랜섬노트 자주 여기)
         Path(user_profile) / "Documents",                                                  # 문서
+        Path(user_profile) / "Downloads",
     ]
     # 존재하는 경로만 반환
     return [r for r in roots if r.exists()]
@@ -187,11 +188,13 @@ def compare_snapshots(before: dict[str, str], after: dict[str, str]) -> dict:
     def _enrich(path_str: str, sha256: str) -> dict:
         p = Path(path_str)
         return {
-            "path":          path_str,
-            "sha256":        sha256,
-            "category":      classify_file(path_str),
+            "path":           path_str,
+            "sha256":         sha256,
+            "category":       classify_file(path_str),
             "is_ransom_note": is_ransom_note(path_str),
-            "size_bytes":    _file_size(p),
+            "size_bytes":     _file_size(p),
+            "ext":            p.suffix.lower(),
+            "created_time":   _get_created_time(p),
         }
 
     created = sorted(created_paths)[:200]
