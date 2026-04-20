@@ -54,3 +54,6 @@ temp/
 # Archives
 *.tar
 *.gz
+
+.env
+host_bridge/workspace/shared/*.json

@@ -57,11 +57,18 @@ def _is_analysis_artifact_path(path_value: str | None) -> bool:
         return True
     return any(part in ANALYSIS_ARTIFACT_DIRS for part in parts[:-1])
 
-def _filter_filesystem_delta(fs_delta: dict[str, Any]) -> dict[str, list[str]]:
-    out: dict[str, list[str]] = {}
+def _filter_filesystem_delta(fs_delta: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """
+    4번 수정사항 반영: fs_monitor의 결과는 {"path", "sha256"} 형태의 dict 리스트입니다.
+    이를 기반으로 노이즈 필터링을 수행합니다.
+    """
+    out: dict[str, list[dict[str, Any]]] = {"created": [], "changed": [], "deleted": []}
     for key in ("created", "changed", "deleted"):
-        values = fs_delta.get(key) or []
-        out[key] = [v for v in values if not _is_analysis_artifact_path(v)]
+        items = fs_delta.get(key) or []
+        for item in items:
+            path = item.get("path") if isinstance(item, dict) else str(item)
+            if not _is_analysis_artifact_path(path):
+                out[key].append(item)
     return out
 
 def _summarize_exec_activity(exec_results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -349,8 +356,10 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
             stop_tcpdump(tcpdump_proc)
 
     proc_after = _process_snapshot()
+    # ── 4번 수정 반영: 각 항목이 {"path": ..., "sha256": ...} 딕셔너리 리스트가 됨
     raw_fs_delta = diff_snapshots(pre_tree, snapshot_tree(artifact_root_path))
     fs_delta = _filter_filesystem_delta(raw_fs_delta)
+    
     exec_activity = _summarize_exec_activity(exec_results)
     archive_success_count = int(exec_activity.get("successful_count", 0))
     process_delta = _estimate_process_delta(proc_before, proc_after, exec_results)
@@ -364,6 +373,7 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
     _write_preview(stdout_path, combined_stdout)
     _write_preview(stderr_path, combined_stderr)
 
+    # 9b97aa 버전의 통합 시그널 로직 적용
     result = {
         "returncode": max((int(r.get("returncode", 0)) for r in exec_results), default=0),
         "timed_out": any(bool(r.get("timed_out")) for r in exec_results),
@@ -373,6 +383,7 @@ def run_dynamic_analysis(sample_path: str, report_id: str, artifact_root: str) -
         "trace_path": trace.get("trace_path"),
         "pcap_path": pcap_path,
         "filesystem_delta": fs_delta,
+        "dropped_files": [], # 로컬 백엔드는 빈 리스트로 스키마 유지
         "process_delta": process_delta,
         "network_trace": filtered_trace,
         "network_signal": bool(filtered_trace.get("connections")),
