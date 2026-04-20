@@ -232,6 +232,18 @@ def _resolve_within(base_dir: Path, relative_name: str) -> Path:
         raise ValueError(f"unsafe_zip_member:{relative_name}")
     return target
 
+def _open_zip_member(zf: zipfile.ZipFile, member: zipfile.ZipInfo):
+    encrypted = bool(getattr(member, "flag_bits", 0) & 0x1)
+    if not encrypted:
+        return zf.open(member)
+    last_error = None
+    for password in settings.archive_password_list:
+        try:
+            return zf.open(member, pwd=password)
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"encrypted_zip_unsupported_or_bad_password:{member.filename}:{last_error}")
+
 def safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
     with zipfile.ZipFile(zip_path) as zf:
         for member in zf.infolist():
@@ -239,7 +251,7 @@ def safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
                 continue
             target = _resolve_within(extract_dir, member.filename)
             target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(member) as src, open(target, "wb") as dst:
+            with _open_zip_member(zf, member) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
 
 def analyze_yara_rules(file_path: Path) -> list[str]:

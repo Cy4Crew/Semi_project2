@@ -90,15 +90,48 @@ def _member_was_attempted(member: dict[str, Any]) -> bool:
 
 def _member_was_successful(member: dict[str, Any]) -> bool:
     status = _lower_str(member.get("execution_status") or member.get("status"))
-    if member.get("executed") is True or member.get("success") is True:
+    if member.get("executed") is True or member.get("success") is True or member.get("succeeded") is True:
         return True
     return status in {"executed", "success", "completed", "ok"}
 
 
-def _normalize_member_results(raw_members: Any) -> tuple[list[dict[str, Any]], set[str], set[str]]:
+def _member_behavior_observed(member: dict[str, Any]) -> bool:
+    if bool(member.get("execution_observed")):
+        return True
+    behavior = member.get("behavior") or {}
+    if isinstance(behavior, dict) and bool(behavior.get("execution_signal")):
+        return True
+    status = _lower_str(member.get("execution_status") or member.get("status"))
+    return status in {"success", "executed", "completed", "ok", "behavior_observed"}
+
+
+def _member_is_av_blocked(member: dict[str, Any]) -> bool:
+    skip_reason = _lower_str(member.get("skip_reason") or member.get("reason") or member.get("error"))
+    status = _lower_str(member.get("execution_status") or member.get("status"))
+    return status == "av_blocked" or "winerror 225" in skip_reason or "virus" in skip_reason or "user consent" in skip_reason
+
+
+def _member_is_timed_out(member: dict[str, Any]) -> bool:
+    status = _lower_str(member.get("execution_status") or member.get("status"))
+    return bool(member.get("timed_out")) or status in {"timeout", "timed_out"}
+
+
+def _member_failed(member: dict[str, Any]) -> bool:
+    status = _lower_str(member.get("execution_status") or member.get("status"))
+    if bool(member.get("failed")):
+        return True
+    return status in {"failed", "error", "crash", "crashed", "timeout", "timed_out", "av_blocked"}
+
+
+def _normalize_member_results(raw_members: Any) -> tuple[list[dict[str, Any]], set[str], set[str], set[str], set[str], set[str], set[str]]:
     normalized: list[dict[str, Any]] = []
     attempted_paths: set[str] = set()
     successful_paths: set[str] = set()
+    behavior_observed_paths: set[str] = set()
+    av_blocked_paths: set[str] = set()
+    timed_out_paths: set[str] = set()
+    failed_paths: set[str] = set()
+    
     for item in raw_members or []:
         if not isinstance(item, dict):
             continue
@@ -106,15 +139,31 @@ def _normalize_member_results(raw_members: Any) -> tuple[list[dict[str, Any]], s
         path = _member_path(member)
         if path:
             member["member_path"] = path
+        
+        # 분석 산출물은 결과 리스트에서 제외
         if _is_analysis_artifact_path(path):
             continue
+            
         normalized.append(member)
         normalized_path = _lower_str(path)
-        if _member_was_attempted(member) and normalized_path:
+        
+        if not normalized_path:
+            continue
+
+        if _member_was_attempted(member):
             attempted_paths.add(normalized_path)
-        if _member_was_successful(member) and normalized_path:
+        if _member_was_successful(member):
             successful_paths.add(normalized_path)
-    return normalized, attempted_paths, successful_paths
+        if _member_behavior_observed(member):
+            behavior_observed_paths.add(normalized_path)
+        if _member_is_av_blocked(member):
+            av_blocked_paths.add(normalized_path)
+        if _member_is_timed_out(member):
+            timed_out_paths.add(normalized_path)
+        if _member_failed(member):
+            failed_paths.add(normalized_path)
+            
+    return normalized, attempted_paths, successful_paths, behavior_observed_paths, av_blocked_paths, timed_out_paths, failed_paths
 
 
 def _normalize_filesystem_delta(raw_delta: Any) -> tuple[dict[str, list[str]], bool]:
@@ -176,6 +225,7 @@ def _normalize_network_trace(raw_trace: Any, member_paths: set[str], success_cou
     disabled = bool(trace.get("disabled", False))
     base_reason = trace.get("reason") or ("vmware_guest_agent" if disabled else "")
     connections = [item for item in (trace.get("connections") or []) if isinstance(item, dict)]
+    
     if success_count <= 0:
         return {
             "disabled": disabled,
@@ -186,9 +236,11 @@ def _normalize_network_trace(raw_trace: Any, member_paths: set[str], success_cou
             "unique_remote": [],
             "connection_count": 0,
         }, False
+        
     filtered_connections = [item for item in connections if _event_matches_member(item, member_paths)]
     unique_remote = sorted({str(item.get("remote") or item.get("dst") or "").strip() for item in filtered_connections if str(item.get("remote") or item.get("dst") or "").strip()})
     reason = trace.get("reason") or ("member_correlated" if filtered_connections else "noise_filtered")
+    
     return {
         "disabled": disabled,
         "reason": reason,
@@ -209,9 +261,17 @@ def _normalize_timeline(raw_timeline: Any, member_paths: set[str], success_count
 
 
 def _normalize_bridge_result(result: dict[str, Any]) -> dict[str, Any]:
-    archive_member_results, attempted_paths, successful_paths = _normalize_member_results(result.get("archive_member_results", []))
+    # 세분화된 상태값들 추출
+    (archive_member_results, attempted_paths, successful_paths, 
+     behavior_observed_paths, av_blocked_paths, timed_out_paths, 
+     failed_paths) = _normalize_member_results(result.get("archive_member_results", []))
+    
     attempted_count = len(attempted_paths)
     success_count = len(successful_paths)
+    behavior_observed_count = len(behavior_observed_paths)
+    av_blocked_count = len(av_blocked_paths)
+    timed_out_count = len(timed_out_paths)
+    failed_count = len(failed_paths)
 
     filesystem_delta, file_signal = _normalize_filesystem_delta(result.get("filesystem_delta"))
     if success_count <= 0:
@@ -236,7 +296,12 @@ def _normalize_bridge_result(result: dict[str, Any]) -> dict[str, Any]:
         "archive_member_results": archive_member_results,
         "archive_member_attempted_count": attempted_count,
         "archive_member_success_count": success_count,
-        "archive_member_exec_count": success_count,
+        "archive_member_exec_count": attempted_count,
+        "archive_member_failed_count": failed_count,
+        "archive_member_timeout_count": timed_out_count,
+        "archive_member_av_blocked_count": av_blocked_count,
+        "archive_member_behavior_observed_count": behavior_observed_count,
+        "archive_member_crash_count": max(0, failed_count - timed_out_count - av_blocked_count),
         "archive_member_skipped_count": max(0, _safe_int(result.get("archive_member_skipped_count"))),
         "archive_file_count": max(_safe_int(result.get("archive_file_count")), len(archive_member_results)),
         "exec_signal": exec_signal,
@@ -246,19 +311,15 @@ def _normalize_bridge_result(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _merge_filesystem_delta(result: dict) -> dict:
-    """
-    guest_agent result.json의 filesystem_delta와
-    system_diff(TEMP/APPDATA/Startup 스캔)를 합쳐 반환.
-    """
     base_delta = result.get("filesystem_delta") or {}
 
     def _normalize(items: list) -> list:
         out = []
         for item in items:
             if isinstance(item, str):
-                out.append({"path": item, "sha256": "", "category": "other_drop"})
+                if not _is_analysis_artifact_path(item):
+                    out.append({"path": item, "sha256": "", "category": "other_drop"})
             elif isinstance(item, dict):
-                # 노이즈 필터링 추가 적용
                 if not _is_analysis_artifact_path(item.get("path", "")):
                     out.append(item)
         return out
@@ -267,7 +328,6 @@ def _merge_filesystem_delta(result: dict) -> dict:
     changed = _normalize(base_delta.get("changed", []))
     deleted = _normalize(base_delta.get("deleted", []))
 
-    # system_diff 병합 (TEMP/APPDATA/Startup 스캔 결과)
     system_diff = result.get("system_diff") or {}
     existing_paths = {c["path"].lower().replace("\\", "/") for c in created}
     
@@ -289,10 +349,12 @@ def _submit_to_slot(slot, sample_path: str, report_id: str, artifact_root: str) 
     bridge_url = str(slot.bridge_url).rstrip('/')
     endpoint = f"{bridge_url}/submit"
     Path(artifact_root).mkdir(parents=True, exist_ok=True)
+    
     with open(sample_path, 'rb') as fp:
         headers = {}
         if str(getattr(settings, "bridge_auth_token", "") or "").strip():
             headers["x-bridge-token"] = str(settings.bridge_auth_token).strip()
+            
         response = requests.post(
             endpoint,
             data={
@@ -305,6 +367,7 @@ def _submit_to_slot(slot, sample_path: str, report_id: str, artifact_root: str) 
             headers=headers,
             timeout=max(30, int(settings.sandbox_job_timeout_seconds) + 60),
         )
+        
     response.raise_for_status()
     payload = response.json()
     raw_path = Path(artifact_root) / f"job_{report_id}_{slot.name}_vmware_bridge_result.json"
@@ -312,10 +375,10 @@ def _submit_to_slot(slot, sample_path: str, report_id: str, artifact_root: str) 
     
     result = payload.get('result', {}) if isinstance(payload, dict) else {}
     
-    # 1. 먼저 9b97aa 기반 정규화 수행
+    # 1. 최신 정규화 로직 적용
     normalized = _normalize_bridge_result(result if isinstance(result, dict) else {})
     
-    # 2. 최종 base 딕셔너리 구성 (병합 및 통합)
+    # 2. 최종 데이터 구성 (병합된 파일 시스템 델타 포함)
     base = {
         'returncode': _safe_int(result.get('returncode', 0)),
         'timed_out': bool(result.get('timed_out', False)),
@@ -325,11 +388,11 @@ def _submit_to_slot(slot, sample_path: str, report_id: str, artifact_root: str) 
         'trace_path': result.get('trace_path'),
         'pcap_path': result.get('pcap_path'),
         
-        # ── 4번 수정: TEMP/APPDATA/Startup 병합 적용
+        # 파일 시스템 병합
         'filesystem_delta': _merge_filesystem_delta(result),
         'dropped_files': result.get('dropped_files', []),
         
-        # ── 9b97aa 수정: 정규화된 데이터 및 카운트 필드 유지
+        # 정규화된 데이터 유지
         'process_delta': normalized['process_delta'],
         'network_trace': normalized['network_trace'],
         'timeline': normalized['timeline'],
@@ -343,6 +406,11 @@ def _submit_to_slot(slot, sample_path: str, report_id: str, artifact_root: str) 
         'archive_member_exec_count': normalized['archive_member_exec_count'],
         'archive_member_attempted_count': normalized['archive_member_attempted_count'],
         'archive_member_success_count': normalized['archive_member_success_count'],
+        'archive_member_failed_count': normalized['archive_member_failed_count'],
+        'archive_member_timeout_count': normalized['archive_member_timeout_count'],
+        'archive_member_av_blocked_count': normalized['archive_member_av_blocked_count'],
+        'archive_member_behavior_observed_count': normalized['archive_member_behavior_observed_count'],
+        'archive_member_crash_count': normalized['archive_member_crash_count'],
         'archive_member_skipped_count': normalized['archive_member_skipped_count'],
         'archive_member_results': normalized['archive_member_results'],
         
@@ -369,7 +437,11 @@ def _submit_to_slot(slot, sample_path: str, report_id: str, artifact_root: str) 
 def run_vmware_bridge_analysis(sample_path: str, report_id: str, artifact_root: str) -> dict:
     attempts = max(1, int(getattr(settings, 'sandbox_bridge_submit_retries', 2)))
     errors: list[str] = []
-    slot_count = max(1, len(list(_SCHEDULER.health(force=True))))
+    
+    # 가용한 슬롯 확인
+    current_health = list(_SCHEDULER.health(force=True))
+    slot_count = max(1, len(current_health))
+    
     for _ in range(attempts * slot_count):
         slot = _SCHEDULER.acquire_vm(report_id=report_id)
         if slot is None:
@@ -383,6 +455,8 @@ def run_vmware_bridge_analysis(sample_path: str, report_id: str, artifact_root: 
         except Exception as exc:
             _SCHEDULER.release_vm(report_id, success=False, reason=str(exc))
             errors.append(f"{slot.name}@{slot.bridge_url}:{exc}")
-            time.sleep(max(0.25, float(getattr(settings, "sandbox_bridge_retry_backoff_seconds", 2.0))) * min(len(errors), 4))
+            backoff = float(getattr(settings, "sandbox_bridge_retry_backoff_seconds", 2.0))
+            time.sleep(max(0.25, backoff) * min(len(errors), 4))
             continue
+            
     raise RuntimeError('vmware_bridge_failed:' + ' | '.join(errors[:6]))

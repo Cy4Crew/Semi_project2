@@ -24,4 +24,4 @@ def test_reports_endpoint_returns_saved_report(tmp_path, monkeypatch):
     response = client.get("/api/reports/")
     assert response.status_code == 200
     data = response.json()
-    assert any(item["report_id"] == "rep001" for item in data)
+    assert any(item["report_id"] == "rep001" for item in data["items"])
