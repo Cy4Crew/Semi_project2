@@ -10,7 +10,9 @@ EVENT_IDS = {
     1: "ProcessCreate",
     3: "NetworkConnect", 
     7: "ImageLoad",
+    10: "ProcessAccess",
     11: "FileCreate",
+    12: "RegistryCreateDelete",
     13: "RegistryValueSet",
 }
 
@@ -27,38 +29,39 @@ NOISE_PROCESSES = {
 
 def collect_sysmon_events(after_ts: float | None = None, max_events: int = 20) -> list[dict]:
     events = []
-    for event_id, event_name in EVENT_IDS.items():
-        try:
-            cmd = [
-                "powershell", "-Command",
-                f"Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' "
-                f"-FilterXPath '*[System[EventID={event_id}]]' "
-                f"-MaxEvents {max_events} -ErrorAction SilentlyContinue | "
-                f"Select-Object -Property TimeCreated, Id, Message | "
-                f"ConvertTo-Json -Depth 3"
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if result.stdout.strip():
-                raw = json.loads(result.stdout)
-                if isinstance(raw, dict):
-                    raw = [raw]
-                for item in raw:
-                    msg = str(item.get("Message", ""))
-                    # 노이즈 프로세스 필터링
-                    img_line = next((l for l in msg.splitlines() if l.strip().startswith("Image:")), "")
-                    img_name = img_line.split("\\")[-1].strip().lower() if img_line else ""
-                    if img_name in NOISE_PROCESSES:
-                        continue
-                    ts = item.get("TimeCreated", {})
-                    events.append({
-                        "event_id": event_id,
-                        "event_name": event_name,
-                        "time": str(ts),
-                        "message": msg[:500],
-                    })
-        except Exception:
-            continue
-        events += collect_file_create_events()
+    event_id_filter = " or ".join(f"EventID={eid}" for eid in EVENT_IDS.keys())
+    try:
+        cmd = [
+            "powershell", "-Command",
+            f"Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' "
+            f"-FilterXPath '*[System[{event_id_filter}]]' "
+            f"-MaxEvents {max_events * len(EVENT_IDS)} -ErrorAction SilentlyContinue | "
+            f"Select-Object -Property TimeCreated, Id, Message | "
+            f"ConvertTo-Json -Depth 3"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.stdout.strip():
+            raw = json.loads(result.stdout)
+            if isinstance(raw, dict):
+                raw = [raw]
+            for item in raw:
+                event_id = int(item.get("Id", 0))
+                event_name = EVENT_IDS.get(event_id, "Unknown")
+                msg = str(item.get("Message", ""))
+                img_line = next((l for l in msg.splitlines() if l.strip().startswith("Image:")), "")
+                img_name = img_line.split("\\")[-1].strip().lower() if img_line else ""
+                if img_name in NOISE_PROCESSES:
+                    continue
+                ts = item.get("TimeCreated", {})
+                events.append({
+                    "event_id": event_id,
+                    "event_name": event_name,
+                    "time": str(ts),
+                    "message": msg[:500],
+                })
+    except Exception:
+        pass
+    events += collect_file_create_events()
     return events
 
 def collect_file_create_events(watch_dirs: list | None = None) -> list[dict]:
@@ -101,7 +104,25 @@ def clear_sysmon_log() -> None:
         )
     except Exception:
         pass
+def summarize_sysmon_events(events: list[dict], member_paths: list | None = None) -> dict:
+    dns_queries = [e for e in events if e.get("event_id") == 22]
+    network_endpoints = [e for e in events if e.get("event_id") == 3]
+    registry_changes = [e for e in events if e.get("event_id") in (12, 13)]
+    process_tree = [e for e in events if e.get("event_id") == 1]
+    image_loads = [e for e in events if e.get("event_id") == 7]
+    anti_analysis = [e for e in events if e.get("event_id") == 10]
 
+    return {
+        "event_count": len(events),
+        "matched_event_count": len(events),
+        "execution_observed": bool(process_tree),
+        "process_tree": process_tree[:20],
+        "registry_changes": registry_changes[:20],
+        "network_endpoints": network_endpoints[:20],
+        "dns_queries": dns_queries[:20],
+        "anti_analysis_signals": anti_analysis[:10],
+        "image_loads": image_loads[:20],
+    }
 
 def save_sysmon_events(events: list[dict], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -6,6 +6,8 @@
       <ImageLoad onmatch="exclude"/>
       <FileCreate onmatch="exclude"/>
       <RegistryEvent onmatch="exclude"/>
+      <DnsQuery onmatch="exclude"/>
+      <ProcessAccess onmatch="exclude"/>
     </RuleGroup>
   </EventFiltering>
 </Sysmon>
