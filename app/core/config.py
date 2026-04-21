@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     report_db_path: str = str(BASE_DIR / "artifacts" / "reports.db")
 
     sample_timeout_seconds: int = 5
+    archive_passwords: str = "infected,malware,infected!,virus"
     max_archive_files: int = 100
     max_archive_exec_members: int = 8
     entropy_threshold: float = 7.2
@@ -33,7 +34,7 @@ class Settings(BaseSettings):
     max_zip_entry_uncompressed_bytes: int = 20 * 1024 * 1024
     max_zip_compression_ratio: float = 250.0
     max_zip_depth_hint: int = 3
-    reject_encrypted_archives: bool = True
+    reject_encrypted_archives: bool = False
     allowed_upload_extensions: str = ".zip"
     allowed_upload_content_types: str = "application/zip,application/x-zip-compressed,multipart/x-zip"
     allowed_upload_magic_hex: str = "504b0304,504b0506,504b0708"
@@ -81,6 +82,72 @@ class Settings(BaseSettings):
     verdict_clean_max: int = 19
     verdict_review_max: int = 39
     verdict_suspicious_max: int = 69
+
+    strong_override_min_score: int = 60
+    suspicious_exec_floor: int = 58
+    malicious_exec_floor: int = 72
+    text_family_hint_cap: int = 12
+    benign_penalty_max: int = 10
+    archive_network_signal_min_links: int = 2
+
+    artifact_output_names: str = (
+        "done.txt,events.jsonl,stdout.txt,stderr.txt,analysis_log.jsonl,network_trace.jsonl,"
+        "report.json,report_static.json,report_dynamic.json,report_memory.json"
+    )
+    artifact_output_prefixes: str = "report_,analysis_,network_"
+    artifact_output_suffixes: str = ".stdout.txt,.stderr.txt,.jsonl.trace,.report.json"
+    artifact_output_dirs: str = "artifacts,artifact,evidence,analysis,logs,output,results,network,trace,sandbox"
+    dynamic_noise_process_names: str = (
+        "system,idle,registry,smss.exe,csrss.exe,wininit.exe,services.exe,lsass.exe,svchost.exe,"
+        "fontdrvhost.exe,dwm.exe,explorer.exe,searchhost.exe,searchindexer.exe,runtimebroker.exe,"
+        "sihost.exe,shellexperiencehost.exe,textinputhost.exe,ctfmon.exe,taskhostw.exe,conhost.exe,"
+        "wmiadap.exe,wmiprvse.exe,dllhost.exe"
+    )
+    dynamic_noise_path_keywords: str = (
+        "\\windows\\system32,\\windows\\syswow64,\\program files\\vmware,\\programdata\\vmware,"
+        "\\windows\\servicing,\\windows\\winsxs"
+    )
+    report_hidden_reason_tokens: str = (
+        "text-like file cap,test artifact cap,text evidence cap,low-risk document cap,ignored analysis artifact"
+    )
+
+
+    @property
+    def archive_password_list(self) -> list[bytes]:
+        out: list[bytes] = []
+        for item in str(self.archive_passwords or "").split(","):
+            token = item.strip()
+            if token:
+                out.append(token.encode("utf-8", errors="ignore"))
+        return out
+
+    @property
+    def artifact_output_name_set(self) -> set[str]:
+        return {item.strip().lower() for item in self.artifact_output_names.split(",") if item.strip()}
+
+    @property
+    def artifact_output_prefix_list(self) -> list[str]:
+        return [item.strip().lower() for item in self.artifact_output_prefixes.split(",") if item.strip()]
+
+    @property
+    def artifact_output_suffix_list(self) -> list[str]:
+        return [item.strip().lower() for item in self.artifact_output_suffixes.split(",") if item.strip()]
+
+    @property
+    def artifact_output_dir_set(self) -> set[str]:
+        return {item.strip().lower() for item in self.artifact_output_dirs.split(",") if item.strip()}
+
+    @property
+    def dynamic_noise_process_name_set(self) -> set[str]:
+        return {item.strip().lower() for item in self.dynamic_noise_process_names.split(",") if item.strip()}
+
+    @property
+    def dynamic_noise_path_keyword_list(self) -> list[str]:
+        return [item.strip().lower() for item in self.dynamic_noise_path_keywords.split(",") if item.strip()]
+
+    @property
+    def report_hidden_reason_token_set(self) -> set[str]:
+        return {item.strip().lower() for item in self.report_hidden_reason_tokens.split(",") if item.strip()}
 
 
 settings = Settings()

@@ -16,20 +16,6 @@ from pathlib import Path
 
 import psutil
 
-# ── 4번: file_diff 모듈 import (같은 guest_tools/ 디렉토리에 위치)
-try:
-    from file_diff import (
-        take_snapshot,
-        compare_snapshots,
-        save_dropped_files,
-        classify_file,
-        is_ransom_note,
-        _get_scan_roots,
-    )
-    _FILE_DIFF_AVAILABLE = True
-except ImportError:
-    _FILE_DIFF_AVAILABLE = False
-
 WORK_DIR = Path(os.environ.get("VM_WORK_DIR", r"C:\sandbox_work")).resolve()
 POLL_SECONDS = int(os.environ.get("VM_AGENT_POLL_SECONDS", "3"))
 SHARED_DIR = Path(os.environ.get("VM_SHARED_DIR") or r"\\vmware-host\Shared Folders\shared")
@@ -512,9 +498,6 @@ def _is_noise_created_path(path_str: str) -> bool:
     name = lower.rsplit('\\', 1)[-1]
     return name.endswith('_stdout.txt') or name.endswith('_stderr.txt') or name in {'stdout.txt', 'stderr.txt'}
 def classify_created_file(path_str: str) -> str:
-    # ── 4번: file_diff 모듈이 있으면 위임, 없으면 기존 로직 폴백
-    if _FILE_DIFF_AVAILABLE:
-        return classify_file(path_str)
     suffix = Path(path_str).suffix.lower()
     lowered = path_str.lower()
     if suffix in BINARY_SUFFIXES:
@@ -860,14 +843,6 @@ def analyze_job(job_dir: Path) -> dict:
     before_tasks = collect_scheduled_tasks()
     before_services = collect_services_snapshot()
 
-    # ── 4번: 실제 Windows 경로(TEMP/APPDATA/Startup 등) 사전 스냅샷
-    if _FILE_DIFF_AVAILABLE:
-        _scan_roots = _get_scan_roots()
-        before_system_snap = take_snapshot(_scan_roots)
-    else:
-        _scan_roots = []
-        before_system_snap = {}
-
     if sample_path.suffix.lower() == ".zip":
         safe_extract(sample_path, extract_dir)
     else:
@@ -930,25 +905,8 @@ def analyze_job(job_dir: Path) -> dict:
     after_services = collect_services_snapshot()
 
     created = sorted(after_files - before_files)
-    created_details = [{\"path\": p, \"category\": classify_created_file(p)} for p in created[:200] if not _is_noise_created_path(p)]
-    dropped_exec_candidates = [c for c in created_details if Path(c[\"path\"]).suffix.lower() in EXEC_SUFFIXES and not str(c[\"path\"]).lower().startswith(\"extract\\\\\")]
-
-    # ── 4번: 실제 Windows 경로 사후 스냅샷 + Diff
-    system_diff: dict = {"created": [], "changed": [], "deleted": []}
-    if _FILE_DIFF_AVAILABLE and before_system_snap is not None:
-        after_system_snap = take_snapshot(_scan_roots)
-        system_diff = compare_snapshots(before_system_snap, after_system_snap)
-        # 시스템 경로에서 발견된 dropped 파일도 created_details에 병합 (중복 제거)
-        existing_paths = {c[\"path\"] for c in created_details}
-        for item in system_diff[\"created\"]:
-            if item[\"path\"] not in existing_paths:
-                created_details.append({
-                    \"path\":     item[\"path\"],
-                    \"category\": item[\"category\"],
-                    \"sha256\":   item[\"sha256\"],
-                    \"size_bytes\": item[\"size_bytes\"],
-                })
-                existing_paths.add(item[\"path\"])
+    created_details = [{"path": p, "category": classify_created_file(p)} for p in created[:200] if not _is_noise_created_path(p)]
+    dropped_exec_candidates = [c for c in created_details if Path(c["path"]).suffix.lower() in EXEC_SUFFIXES and not str(c["path"]).lower().startswith("extract\\")]
 
     process_delta = summarize_process_delta(before_proc, after_proc)
     live_processes = []
@@ -1045,14 +1003,7 @@ def analyze_job(job_dir: Path) -> dict:
     file_signal = bool([c for c in created_details if c.get("category") not in {"other_drop"}])
     network_signal = bool([x for x in network_trace["endpoints"] if int(x.get("pid", 0) or 0) > 0]) or any(k in combined_l for k in ["http://", "https://", "ftp://"])
     ransomware_signal = any(k in combined_l for k in ["vssadmin", "wbadmin", "bcdedit", "ransom", "decrypt"])
-    # ── 4번: ransom_note 탐지를 file_diff.is_ransom_note()로 강화
-    if _FILE_DIFF_AVAILABLE:
-        note_signal = any(
-            is_ransom_note(c["path"]) or c.get("category") == "ransom_note"
-            for c in created_details
-        )
-    else:
-        note_signal = any(Path(c["path"]).suffix.lower() == ".txt" and ("readme" in c["path"].lower() or "decrypt" in c["path"].lower()) for c in created_details)
+    note_signal = any(Path(c["path"]).suffix.lower() == ".txt" and ("readme" in c["path"].lower() or "decrypt" in c["path"].lower()) for c in created_details)
 
     score = 0
     if exec_signal:
@@ -1115,8 +1066,6 @@ def analyze_job(job_dir: Path) -> dict:
             "deleted": [],
             "created_details": created_details,
         },
-        # ── 4번: TEMP/APPDATA/Startup 등 실제 Windows 경로 Diff
-        "system_diff": system_diff,
         "process_delta": process_delta,
         "network_trace": network_trace,
         "network_signal": network_signal,
@@ -1158,18 +1107,6 @@ def analyze_job(job_dir: Path) -> dict:
     }
 
     (outbox / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # ── 4번: dropped_files.json 별도 저장 (host_bridge가 outbox를 통해 Docker로 전달)
-    if _FILE_DIFF_AVAILABLE:
-        try:
-            save_dropped_files(
-                diff=system_diff,
-                output_path=outbox / "dropped_files.json",
-                scan_roots=_scan_roots,
-            )
-        except Exception:
-            pass
-
     return result
 
 

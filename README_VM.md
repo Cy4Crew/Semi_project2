@@ -84,8 +84,8 @@ VM > Install VMware Tools
 
 Install both:
 
-- vc_redist.x64.exe
-- vc_redist.x86.exe
+- [vc_redist.x64.exe](https://aka.ms/vc14/vc_redist.x64.exe)
+- [vc_redist.x86.exe](https://aka.ms/vc14/vc_redist.x86.exe)
 
 ### Python
 

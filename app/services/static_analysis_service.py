@@ -6,8 +6,10 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import zipfile
 from pathlib import Path
+from typing import Any
 
 try:
     import pefile  # type: ignore
@@ -30,20 +32,13 @@ MEDIUM_MALWARE_KEYWORDS = {
     "certutil", "regsvr32", "rundll32", "schtasks", "urlmon",
     "wget", "curl", "cmd.exe",
 }
-
 RANSOMWARE_KEYWORDS = {
     "vssadmin delete shadows",
     "wbadmin delete catalog",
     "bcdedit /set {default} recoveryenabled no",
     "bcdedit /set {default} bootstatuspolicy ignoreallfailures",
-    "shadowcopy",
-    "readme.txt",
-    ".locked",
-    ".encrypted",
-    "decrypt",
-    "ransom",
-    "recover files",
-    "bitcoin",
+    "shadowcopy", ".locked", ".encrypted", "decrypt", "ransom",
+    "recover files", "bitcoin", "restore files", "readme_restore_files",
 }
 DOWNLOADER_KEYWORDS = {
     "urlmon", "urldownloadtofile", "downloadstring", "invoke-webrequest",
@@ -55,24 +50,14 @@ RAT_KEYWORDS = {
     "wscript.shell", "backdoor", "c2", "beacon", "shellcode",
 }
 STEALER_KEYWORDS = {
-    "login data",
-    "web data",
-    "cookies",
-    "local state",
-    "discord",
-    "token",
-    "wallet",
-    "metamask",
-    "chromium",
-    "firefox",
-    "sqlite",
-    "browser credential",
+    "login data", "web data", "cookies", "local state", "discord", "token",
+    "wallet", "metamask", "chromium", "firefox", "sqlite", "browser credential",
     "telegram",
 }
 
 DEV_PATH_MARKERS = {
     "__pycache__", ".git", ".idea", ".vscode", "node_modules", ".pytest_cache",
-    "dist", "build", ".next", ".nuxt", ".mypy_cache", ".venv", "venv",
+    ".next", ".nuxt", ".mypy_cache", ".venv", "venv",
 }
 LOW_RISK_SUFFIXES = {
     ".md", ".rst", ".yml", ".yaml", ".json", ".css", ".scss",
@@ -82,7 +67,7 @@ TEXT_LIKE_SUFFIXES = {".txt", ".log", ".csv"}
 HIGH_RISK_SCRIPT_SUFFIXES = {".ps1", ".hta", ".vbs", ".wsf", ".js", ".jse", ".docm", ".xlsm", ".yar"}
 SOURCE_SUFFIXES = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".c", ".cpp", ".cs"}
 DOC_SUFFIXES = {".docm", ".xlsm", ".doc", ".docx", ".xls", ".xlsx"}
-EXECUTABLE_EXTENSIONS = {".exe", ".dll", ".com"}
+EXECUTABLE_EXTENSIONS = {".exe", ".dll", ".com", ".scr", ".bin"}
 
 PE_IMPORTS_HIGH = {
     "CreateRemoteThread", "VirtualAlloc", "WriteProcessMemory", "WinExec",
@@ -100,22 +85,24 @@ IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 BASE64_RE = re.compile(rb"(?:[A-Za-z0-9+/]{20,}={0,2})")
 LOCAL_DOMAINS = {"localhost", "127.0.0.1", "example.com", "example.invalid", "mail.example.org", "8.8.8.8"}
 
-SELF_ANALYZER_MARKERS = {
-    "yara.compile", "pefile.pe", "createremotethread", "writeprocessmemory",
-    "rule suspicious_", "pe_imports_high", "malware_keywords", "virustotal",
-}
+SELF_ANALYZER_MARKERS = {"yara.compile", "pefile.pe", "rule suspicious_", "virustotal"}
 BENIGN_DEV_MARKERS = {
     "fastapi", "uvicorn", "jinja2", "sqlalchemy", "pydantic", "react", "nextjs",
     "docker compose", "dockerfile", "requirements.txt", "package.json",
 }
-TEST_ARTIFACT_MARKERS = {
-    "sample", "samples", "test", "eicar", "readme", "generate_", "yara_bait", "fake_", "benign",
+
+ANALYSIS_ARTIFACT_NAMES = {
+    "done.txt", "events.jsonl", "stdout.txt", "stderr.txt",
+    "analysis_log.jsonl", "network_trace.jsonl", "report.json",
 }
+ANALYSIS_ARTIFACT_PREFIXES = ("report_",)
+ANALYSIS_ARTIFACT_SUFFIXES = ("_stdout.txt", "_stderr.txt", ".evtx")
+ANALYSIS_ARTIFACT_PARTS = {"evidence", "artifacts", "analysis", "logs", "log", "report", "reports"}
 
 def calculate_entropy(data: bytes) -> float:
     if not data:
         return 0.0
-    freq = {}
+    freq: dict[int, int] = {}
     for b in data:
         freq[b] = freq.get(b, 0) + 1
     entropy = 0.0
@@ -125,16 +112,31 @@ def calculate_entropy(data: bytes) -> float:
         entropy -= p * math.log2(p)
     return entropy
 
-def extract_strings(data: bytes):
+def extract_strings(data: bytes) -> list[bytes]:
     return re.findall(rb"[ -~]{4,}", data)
 
-def _is_dev_artifact(file_path: Path) -> bool:
-    lowered = str(file_path).lower()
-    return any(marker in lowered for marker in DEV_PATH_MARKERS)
+def _normalized_parts(file_path: Path) -> list[str]:
+    return [part.lower() for part in file_path.parts]
 
-def _is_test_artifact(file_path: Path) -> bool:
-    lowered = str(file_path).lower()
-    return any(marker in lowered for marker in TEST_ARTIFACT_MARKERS)
+def _looks_like_analysis_artifact(file_path: Path) -> bool:
+    name = file_path.name.lower()
+    parts = _normalized_parts(file_path)
+    stem = file_path.stem.lower()
+    if name in ANALYSIS_ARTIFACT_NAMES:
+        return True
+    if any(name.startswith(prefix) for prefix in ANALYSIS_ARTIFACT_PREFIXES):
+        return True
+    if any(name.endswith(suffix) for suffix in ANALYSIS_ARTIFACT_SUFFIXES):
+        return True
+    if any(part in ANALYSIS_ARTIFACT_PARTS for part in parts[:-1]):
+        return True
+    if stem in {"done", "events", "stdout", "stderr", "network_trace", "analysis_log"} and file_path.suffix.lower() in {".txt", ".json", ".jsonl", ".log"}:
+        return True
+    return False
+
+def _is_dev_artifact(file_path: Path) -> bool:
+    lowered = str(file_path).replace("\\", "/").lower()
+    return any(marker in lowered for marker in DEV_PATH_MARKERS)
 
 def _is_low_risk_doc(file_path: Path) -> bool:
     return file_path.suffix.lower() in LOW_RISK_SUFFIXES
@@ -159,7 +161,7 @@ def _has_benign_dev_markers(texts: list[str]) -> bool:
     joined = _joined(texts)
     return sum(1 for marker in BENIGN_DEV_MARKERS if marker.lower() in joined) >= 2
 
-def analyze_keyword_tiers(strings, source_code: bool):
+def analyze_keyword_tiers(strings: list[bytes], source_code: bool) -> tuple[list[str], list[str], list[str], list[str]]:
     lowered = [s.lower() for s in strings]
     strong = set()
     medium = set()
@@ -182,12 +184,11 @@ def analyze_keyword_tiers(strings, source_code: bool):
         medium = set(list(sorted(medium))[:2])
     return sorted(strong), sorted(medium), sorted(ransom), sorted(stealer)
 
-def extract_iocs_from_texts(texts):
+def extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
     joined = "\n".join(texts)
     urls = [u for u in sorted(set(URL_RE.findall(joined))) if "localhost" not in u and "127.0.0.1" not in u][:20]
     emails = [e for e in sorted(set(EMAIL_RE.findall(joined))) if e.split("@")[-1].lower() not in LOCAL_DOMAINS][:20]
-
-    ips = []
+    ips: list[str] = []
     for candidate in IP_RE.findall(joined):
         try:
             ip = ipaddress.ip_address(candidate)
@@ -195,7 +196,6 @@ def extract_iocs_from_texts(texts):
                 ips.append(candidate)
         except ValueError:
             pass
-
     domains = set()
     for url in urls:
         try:
@@ -208,16 +208,10 @@ def extract_iocs_from_texts(texts):
         host = email.split("@")[-1].lower()
         if host and host not in LOCAL_DOMAINS:
             domains.add(host)
+    return {"urls": urls, "emails": emails, "domains": sorted(domains)[:20], "ips": sorted(set(ips))[:20]}
 
-    return {
-        "urls": urls,
-        "emails": emails,
-        "domains": sorted(domains)[:20],
-        "ips": sorted(set(ips))[:20],
-    }
-
-def try_decode_base64_blobs(data: bytes):
-    decoded_texts = []
+def try_decode_base64_blobs(data: bytes) -> list[str]:
+    decoded_texts: list[str] = []
     for blob in BASE64_RE.findall(data):
         try:
             decoded = base64.b64decode(blob, validate=True)
@@ -238,6 +232,18 @@ def _resolve_within(base_dir: Path, relative_name: str) -> Path:
         raise ValueError(f"unsafe_zip_member:{relative_name}")
     return target
 
+def _open_zip_member(zf: zipfile.ZipFile, member: zipfile.ZipInfo):
+    encrypted = bool(getattr(member, "flag_bits", 0) & 0x1)
+    if not encrypted:
+        return zf.open(member)
+    last_error = None
+    for password in settings.archive_password_list:
+        try:
+            return zf.open(member, pwd=password)
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"encrypted_zip_unsupported_or_bad_password:{member.filename}:{last_error}")
+
 def safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
     with zipfile.ZipFile(zip_path) as zf:
         for member in zf.infolist():
@@ -245,11 +251,11 @@ def safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
                 continue
             target = _resolve_within(extract_dir, member.filename)
             target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(member) as src, open(target, "wb") as dst:
+            with _open_zip_member(zf, member) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
 
-def analyze_yara_rules(file_path: Path):
-    matches = []
+def analyze_yara_rules(file_path: Path) -> list[str]:
+    matches: list[str] = []
     try:
         file_map = {p.stem: str(p) for p in Path(settings.yara_rules_dir).glob("*.yar")}
         if not file_map:
@@ -263,14 +269,8 @@ def analyze_yara_rules(file_path: Path):
         matches.append(f"yara_error:{e}")
     return matches
 
-def analyze_pe_imports(file_path: Path):
-    result = {
-        "imports": [],
-        "suspicious_imports": [],
-        "medium_imports": [],
-        "is_pe": False,
-        "compile_timestamp": None,
-    }
+def analyze_pe_imports(file_path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {"imports": [], "suspicious_imports": [], "medium_imports": [], "is_pe": False, "compile_timestamp": None}
     if pefile is None:
         result["error"] = "pefile_unavailable"
         return result
@@ -278,11 +278,9 @@ def analyze_pe_imports(file_path: Path):
         pe = pefile.PE(str(file_path), fast_load=False)
         result["is_pe"] = True
         result["compile_timestamp"] = getattr(pe.FILE_HEADER, "TimeDateStamp", None)
-
-        all_imports = []
+        all_imports: list[str] = []
         suspicious = set()
         medium = set()
-
         if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
             for entry in pe.DIRECTORY_ENTRY_IMPORT:
                 dll_name = entry.dll.decode(errors="ignore") if entry.dll else "unknown"
@@ -294,7 +292,6 @@ def analyze_pe_imports(file_path: Path):
                             suspicious.add(name)
                         elif name in PE_IMPORTS_MEDIUM:
                             medium.add(name)
-
         result["imports"] = all_imports[:150]
         result["suspicious_imports"] = sorted(suspicious)
         result["medium_imports"] = sorted(medium)
@@ -307,13 +304,10 @@ def _has_macro_indicator(data: bytes, texts: list[str]) -> bool:
     return b"vba" in data.lower() or "macros/vba" in lowered or "thisdocument" in lowered or "autoopen" in lowered
 
 def _com_binary_heuristics(data: bytes, texts: list[str]) -> tuple[bool, list[str]]:
-    reasons = []
+    reasons: list[str] = []
     lowered = "\n".join(texts).lower()
     mz_like = data[:2] == b"MZ"
-    has_cmd_markers = any(k in lowered for k in [
-        "powershell", "cmd.exe", "rundll32", "regsvr32", "certutil",
-        "wget", "curl", "invoke-webrequest", "downloadstring"
-    ])
+    has_cmd_markers = any(k in lowered for k in ["powershell", "cmd.exe", "rundll32", "regsvr32", "certutil", "wget", "curl", "invoke-webrequest", "downloadstring"])
     high_entropy = calculate_entropy(data) > settings.entropy_threshold + 0.2
     if mz_like:
         reasons.append("mz_header")
@@ -338,7 +332,7 @@ def _count_obfuscation_markers(texts: list[str], data: bytes) -> int:
         markers += 1
     return markers
 
-def _detect_family_keywords(texts: list[str]):
+def _detect_family_keywords(texts: list[str]) -> tuple[list[str], list[str], list[str], list[str]]:
     joined = _joined(texts)
     ransom = sorted({k for k in RANSOMWARE_KEYWORDS if k in joined})
     stealer = sorted({k for k in STEALER_KEYWORDS if k in joined})
@@ -353,16 +347,24 @@ def _looks_like_dropper(source_code: bool, clean_yara: list[str], downloader_kw:
         return True
     return False
 
-def analyze_file(file_path: Path):
+def _relative_member_path(file_path: Path, archive_root: Path | None = None) -> str:
+    if archive_root is not None:
+        try:
+            return str(file_path.relative_to(archive_root)).replace("\\", "/")
+        except Exception:
+            pass
+    return file_path.name
+
+def analyze_file(file_path: Path, archive_root: Path | None = None) -> dict[str, Any]:
+    rel_path = _relative_member_path(file_path, archive_root)
     source_code = _is_source_code(file_path)
     dev_artifact = _is_dev_artifact(file_path)
-    test_artifact = _is_test_artifact(file_path)
     low_risk_doc = _is_low_risk_doc(file_path)
     text_like = _is_text_like(file_path)
     high_risk_script = _is_high_risk_script(file_path)
 
-    result = {
-        "file": str(file_path),
+    result: dict[str, Any] = {
+        "file": rel_path,
         "score": 0,
         "tags": [],
         "iocs": {"urls": [], "emails": [], "domains": [], "ips": []},
@@ -372,12 +374,17 @@ def analyze_file(file_path: Path):
         "severity": "low",
         "summary_reasons": [],
         "source_code": source_code,
-        "developer_artifact": dev_artifact or test_artifact,
+        "developer_artifact": dev_artifact,
         "evidence_tier": "none",
         "suspected_family": [],
     }
 
     try:
+        if _looks_like_analysis_artifact(Path(rel_path)):
+            result["summary_reasons"].append("ignored analysis artifact")
+            result["developer_artifact"] = True
+            return result
+
         if dev_artifact or file_path.suffix.lower() == ".pyc":
             result["summary_reasons"].append("ignored developer artifact")
             return result
@@ -396,7 +403,7 @@ def analyze_file(file_path: Path):
         if file_path.suffix.lower() in EXECUTABLE_EXTENSIONS:
             pe_result = analyze_pe_imports(file_path)
             result["pe"] = pe_result
-            if not pe_result.get("is_pe"):
+            if file_path.suffix.lower() in {".exe", ".dll", ".com"} and not pe_result.get("is_pe") and file_path.suffix.lower() != ".bin":
                 result["summary_reasons"].append("not a real PE file")
                 return result
 
@@ -406,7 +413,7 @@ def analyze_file(file_path: Path):
                 return result
 
         if file_path.suffix.lower() == ".com":
-            com_hit, com_reasons = _com_binary_heuristics(data, all_texts)
+            com_hit, _ = _com_binary_heuristics(data, all_texts)
             if not com_hit:
                 result["summary_reasons"].append("no executable .com indicator")
                 return result
@@ -503,7 +510,7 @@ def analyze_file(file_path: Path):
             result["suspected_family"].append("dropper")
             result["summary_reasons"].append("dropper-like evidence chain")
 
-        if len(ransom_kw) >= 2 or any("ransom" in x or "decrypt" in x or "shadow" in x for x in ransom_kw):
+        if len(ransom_kw) >= 2 or file_path.suffix.lower() == ".locked":
             result["suspected_family"].append("ransomware")
             strong_evidence += 1
             result["summary_reasons"].append("ransomware-like behavior strings")
@@ -516,7 +523,7 @@ def analyze_file(file_path: Path):
             result["suspected_family"].append("infostealer")
             medium_evidence += 1
             result["summary_reasons"].append("credential theft / wallet strings")
-        elif stealer_kw:
+        elif stealer_kw and file_path.suffix.lower() not in {".locked"}:
             result["suspected_family"].append("infostealer")
 
         score = 0
@@ -542,15 +549,8 @@ def analyze_file(file_path: Path):
             score = min(score, 4)
 
         allow_text_like_escalation = bool(
-            high_family
-            or clean_yara
-            or strong_kw
-            or ioc_count
-            or downloader_kw
-            or rat_kw
-            or len(ransom_kw) >= 2
-            or len(stealer_kw) >= 2
-            or high_risk_script
+            high_family or clean_yara or strong_kw or ioc_count or downloader_kw or rat_kw or
+            len(ransom_kw) >= 2 or len(stealer_kw) >= 2 or high_risk_script or file_path.suffix.lower() == ".locked"
         )
 
         if low_risk_doc:
@@ -566,62 +566,22 @@ def analyze_file(file_path: Path):
             score = min(score, 4)
             result["summary_reasons"].append("text evidence cap")
 
-        if test_artifact and file_path.suffix.lower() in {".txt", ".md", ".py", ".yar"}:
-            score = min(score, 3)
-            result["summary_reasons"].append("test artifact cap")
-
-        
-        # TXT tier classification
         if file_path.suffix.lower() == ".txt":
             joined_text = "\n".join(all_texts).lower()
             ransom_note_patterns = [
-                "your files are encrypted",
-                "your files have been encrypted",
-                "decrypt your files",
-                "recover your files",
-                "restore your files",
-                "private key",
-                "contact us",
-                "send payment",
-                "payment",
-                "bitcoin",
-                "monero",
-                "tor",
-                ".onion",
-                "decryption service",
-                "ransom note",
-                "readme_decrypt",
-                "readme.txt",
+                "your files are encrypted", "your files have been encrypted", "decrypt your files",
+                "recover your files", "restore your files", "private key", "contact us",
+                "send payment", "payment", "bitcoin", "monero", "tor", ".onion",
+                "decryption service", "ransom note", "readme_decrypt", "readme.txt",
             ]
-            log_patterns = [
-                "[info]", "[debug]", "[warning]", "[error]", "traceback",
-                "http request:", "status=", "returncode", "stdout", "stderr"
-            ]
-            desc_patterns = [
-                "this file is", "readme", "test artifact", "sample set",
-                "generated for testing", "benign", "detector-test", "not intended to be executed"
-            ]
-            script_patterns = [
-                "powershell", "invoke-webrequest", "downloadstring",
-                "frombase64string", "cmd.exe", "rundll32", "regsvr32",
-                "certutil", "bitsadmin", "mshta", "wscript.shell"
-            ]
+            log_patterns = ["[info]", "[debug]", "[warning]", "[error]", "traceback", "http request:", "status=", "returncode", "stdout", "stderr"]
+            script_patterns = ["powershell", "invoke-webrequest", "downloadstring", "frombase64string", "cmd.exe", "rundll32", "regsvr32", "certutil", "bitsadmin", "mshta", "wscript.shell"]
 
             ransom_hit_count = sum(1 for p in ransom_note_patterns if p in joined_text)
             log_hit_count = sum(1 for p in log_patterns if p in joined_text)
-            desc_hit_count = sum(1 for p in desc_patterns if p in joined_text)
             script_hit_count = sum(1 for p in script_patterns if p in joined_text)
 
-            if (
-                script_hit_count >= 2
-                and (len(clean_yara) >= 2 or ioc_count >= 1)
-                and (
-                    "powershell" in joined_text
-                    or "cmd.exe" in joined_text
-                    or "downloadstring" in joined_text
-                    or "invoke-webrequest" in joined_text
-                )
-            ):
+            if script_hit_count >= 2 and (len(clean_yara) >= 2 or ioc_count >= 1):
                 result["tags"].append("script_like_txt")
                 result["summary_reasons"].append("script-like malicious text")
                 score = max(score, 5)
@@ -637,16 +597,11 @@ def analyze_file(file_path: Path):
                 result["tags"].append("log_txt")
                 result["summary_reasons"].append("log-like text file")
                 score = min(score, 1)
-            elif desc_hit_count >= 1:
-                result["tags"].append("descriptive_txt")
-                result["summary_reasons"].append("descriptive text file")
-                score = min(score, 1)
             else:
                 result["tags"].append("plain_txt")
-                score = min(score, 1)
+                score = min(score, max(score, 1))
 
         result["score"] = max(0, score)
-
         if result["score"] >= 8:
             result["severity"] = "high"
         elif result["score"] >= 4:
@@ -662,21 +617,53 @@ def analyze_file(file_path: Path):
     result["suspected_family"] = sorted(set(result["suspected_family"]))
     return result
 
-def analyze_archive(zip_path: str):
-    results = []
-    extract_dir = Path("/tmp/sample_ext")
+def _should_skip_archive_member(file_path: Path, extract_root: Path) -> bool:
+    rel = Path(_relative_member_path(file_path, extract_root))
+    if _looks_like_analysis_artifact(rel):
+        return True
+    if file_path.suffix.lower() == ".pyc":
+        return True
+    return False
 
-    if extract_dir.exists():
-        shutil.rmtree(extract_dir)
-
-    safe_extract_zip(Path(zip_path), extract_dir)
-
-    count = 0
-    for f in extract_dir.rglob("*"):
-        if f.is_file():
-            results.append(analyze_file(f))
+def analyze_archive(zip_path: str) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    temp_dir = Path(tempfile.mkdtemp(prefix="sample_ext_"))
+    extract_dir = temp_dir / "extract"
+    try:
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        safe_extract_zip(Path(zip_path), extract_dir)
+        count = 0
+        for f in extract_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            if _should_skip_archive_member(f, extract_dir):
+                continue
+            results.append(analyze_file(f, extract_dir))
             count += 1
             if count >= settings.max_archive_files:
                 break
 
-    return results
+        return {
+            "files": results,
+            "summary": {
+                "file_count": len(results),
+                "high_confidence_files": sum(1 for x in results if x.get("suspected_family")),
+                "high_severity_files": sum(1 for x in results if str(x.get("severity")) == "high"),
+            },
+        }
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+def analyze_static(sample_path: str) -> dict[str, Any]:
+    path = Path(sample_path)
+    if path.suffix.lower() == ".zip":
+        return analyze_archive(str(path))
+    item = analyze_file(path)
+    return {
+        "files": [item],
+        "summary": {
+            "file_count": 1,
+            "high_confidence_files": 1 if item.get("suspected_family") else 0,
+            "high_severity_files": 1 if str(item.get("severity")) == "high" else 0,
+        },
+    }
